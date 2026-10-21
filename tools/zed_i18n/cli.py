@@ -15,6 +15,7 @@ from .config import load_project_config, zed_checkout_path, zed_clean_extract_ch
 from .context_groups import build_context_groups, write_context_group_reports
 from .extract import extract_repository
 from .packaging import generate_packaging_files
+from .readd_manual import readd_manual_strings
 from .runtime_bundles import generate_runtime_bundles, release_locale_ids
 from .translation_pipeline import (
     PrepareTranslationOptions,
@@ -44,6 +45,17 @@ def build_parser() -> argparse.ArgumentParser:
     audit_parser.add_argument(
         "--zed-root",
         help="Zed source checkout to audit. Use a clean upstream checkout.",
+    )
+
+    readd_parser = subparsers.add_parser("readd-manual")
+    readd_parser.add_argument(
+        "--zed-root",
+        help="Zed source checkout the recorded byte spans are verified against.",
+    )
+    readd_parser.add_argument(
+        "--from-ref",
+        default="HEAD",
+        help="Git ref whose manifest holds the hand-registered strings.",
     )
 
     validate_parser = subparsers.add_parser("validate")
@@ -184,6 +196,8 @@ def main(argv: list[str] | None = None) -> int:
         return run_extract(root, args.zed_root)
     if args.command == "audit-candidates":
         return run_audit_candidates(root, args.zed_root)
+    if args.command == "readd-manual":
+        return run_readd_manual(root, args.from_ref, args.zed_root)
     if args.command == "validate":
         return run_validate(root, args.language, cleanup=args.cleanup)
     if args.command == "apply":
@@ -249,6 +263,39 @@ def run_fetch_zed(root: Path) -> int:
         subprocess.run(build_clone_command(config, checkout_path), check=True)
         verify_checkout_revision(config, checkout_path)
     return 0
+
+
+def _read_json_from_ref(root: Path, ref: str, relative: str) -> dict:
+    result = subprocess.run(
+        ["git", "-C", str(root), "show", f"{ref}:{relative}"],
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    return json.loads(result.stdout)
+
+
+def run_readd_manual(root: Path, from_ref: str, zed_root: str | None) -> int:
+    config = load_project_config(root)
+    source_root = resolve_zed_root(root, config, zed_root)
+    manifest_path = root / "manifest" / "ui-strings.json"
+    catalog_path = root / "catalog" / "en-US.json"
+    current_manifest = _read_json_if_exists(manifest_path)
+    current_catalog = _read_json_if_exists(catalog_path)
+    readded, mismatched = readd_manual_strings(
+        _read_json_from_ref(root, from_ref, "manifest/ui-strings.json"),
+        _read_json_from_ref(root, from_ref, "catalog/en-US.json"),
+        current_manifest,
+        current_catalog,
+        source_root,
+    )
+    if readded:
+        _write_json(manifest_path, current_manifest)
+        _write_json(catalog_path, current_catalog)
+    print(f"Re-added {len(readded)} manually registered strings")
+    for key in mismatched:
+        print(f"byte span no longer matches the source: {key}")
+    return 1 if mismatched else 0
 
 
 def run_extract(root: Path, zed_root: str | None = None) -> int:
