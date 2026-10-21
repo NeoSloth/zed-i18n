@@ -1,0 +1,1161 @@
+diff --git a/crates/edit_prediction/src/license_detection.rs b/crates/edit_prediction/src/license_detection.rs
+index 309b35f..3e7683c 100644
+--- a/crates/edit_prediction/src/license_detection.rs
++++ b/crates/edit_prediction/src/license_detection.rs
+@@ -320,7 +320,9 @@ impl LicenseDetectionWatcher {
+                 worktree::Event::DeletedEntry(_)
+                 | worktree::Event::UpdatedGitRepositories(_)
+                 | worktree::Event::UpdatedRootRepoCommonDir { .. }
+-                | worktree::Event::Deleted => {}
++                | worktree::Event::Deleted
++                | worktree::Event::RootUnavailable
++                | worktree::Event::RootAvailable => {}
+             });
+ 
+         let worktree_snapshot = worktree.read(cx).snapshot();
+diff --git a/crates/editor/src/items.rs b/crates/editor/src/items.rs
+index 3c6d585..ff3c937 100644
+--- a/crates/editor/src/items.rs
++++ b/crates/editor/src/items.rs
+@@ -805,6 +805,22 @@ impl Item for Editor {
+             .and_then(|buffer| buffer.read(cx).file())
+             .is_some_and(|file| file.disk_state().is_deleted());
+ 
++        // 共有ごと到達できない間はバッファとタブを生かし続けるので、その状態を ✕ で示す。
++        // 実際に削除された場合とは区別したい（復帰後は共有の内容が正になるため）。
++        let volume_unavailable = self
++            .buffer()
++            .read(cx)
++            .as_singleton()
++            .and_then(|buffer| {
++                let project_path = buffer.read(cx).project_path(cx)?;
++                let worktree = self
++                    .project()?
++                    .read(cx)
++                    .worktree_for_id(project_path.worktree_id, cx)?;
++                Some(worktree.read(cx).root_unavailable())
++            })
++            .unwrap_or(false);
++
+         h_flex()
+             .gap_1()
+             .when(!params.selected, |tab| tab.track_focus(&self.focus_handle))
+@@ -826,7 +842,7 @@ impl Item for Editor {
+                     this.truncate_middle().flex_1()
+                 })
+                 .when(params.preview, |this| this.italic())
+-                .when(was_deleted, |this| this.strikethrough()),
++                .when(was_deleted || volume_unavailable, |this| this.strikethrough()),
+             )
+             .when_some(description, |this, description| {
+                 this.child(
+@@ -839,6 +855,13 @@ impl Item for Editor {
+                         .color(Color::Muted),
+                 )
+             })
++            .when(volume_unavailable, |this| {
++                this.child(
++                    Icon::new(IconName::XCircle)
++                        .color(Color::Error)
++                        .size(IconSize::XSmall),
++                )
++            })
+             .into_any_element()
+     }
+ 
+@@ -1507,6 +1530,12 @@ impl SerializableItem for Editor {
+         });
+ 
+         let is_dirty = buffer.read(cx).is_dirty();
++        // 削除された・共有ごと到達できないファイルは、次に Zed を開いた時にディスクから読めない。
++        // 本文を保つにはここに保存しておくしかない（ディスクにある通常のファイルは読ませる）。
++        let file_absent_from_disk = buffer
++            .read(cx)
++            .file()
++            .is_some_and(|file| file.disk_state().is_deleted());
+         let mtime = buffer.read(cx).saved_mtime();
+         let content_language_detection_enabled =
+             buffer.read(cx).content_language_detection_enabled();
+@@ -1515,7 +1544,7 @@ impl SerializableItem for Editor {
+ 
+         let db = EditorDb::global(cx);
+         Some(cx.background_spawn(async move {
+-            let (contents, language) = if serialize_dirty_buffers && is_dirty {
++            let (contents, language) = if serialize_dirty_buffers && (is_dirty || file_absent_from_disk) {
+                 let contents = snapshot.text();
+                 let language = snapshot.language().and_then(|language| {
+                     if content_language_detection_enabled && *language == *PLAIN_TEXT {
+diff --git a/crates/fs/src/fs.rs b/crates/fs/src/fs.rs
+index 69ca5c8..64754f3 100644
+--- a/crates/fs/src/fs.rs
++++ b/crates/fs/src/fs.rs
+@@ -198,6 +198,15 @@ pub trait Fs: Send + Sync {
+     /// deliver events (network mounts, some FUSE and WSL mounts), so it must be polled.
+     fn requires_poll_watcher(&self, path: &Path) -> bool;
+ 
++    /// その場所がネットワーク共有（SMB/NFS/AFP/WebDAV）や FUSE 上にあるか。
++    ///
++    /// 監視方式の指定ではなくボリュームそのものの性質を問う質問なので、
++    /// `requires_poll_watcher` とは別に扱う。マウントが解けた直後は `path` 自体に
++    /// 到達できないため、到達できる祖先を見て判定する。
++    fn is_on_network_volume(&self, _path: &Path) -> bool {
++        false
++    }
++
+     /// 設定ファイルで指定された監視方式を受け取る。
+     /// 監視する場所を持たない実装では何もしない。
+     fn set_file_watch_mode(&self, _mode: FileWatchMode) {}
+@@ -1246,6 +1255,10 @@ impl Fs for RealFs {
+         }
+     }
+ 
++    fn is_on_network_volume(&self, path: &Path) -> bool {
++        fs_watcher::is_on_network_volume(self, path)
++    }
++
+     fn set_file_watch_mode(&self, mode: FileWatchMode) {
+         *self.file_watch_mode.lock() = mode;
+     }
+@@ -1516,6 +1529,7 @@ struct FakeFsState {
+     trash: Mutex<SlotMap<TrashId, (TrashedEntry, FakeFsEntry)>>,
+     remove_dir_errors: std::collections::HashMap<PathBuf, String>,
+     case_sensitive: bool,
++    network_volume_prefixes: Vec<PathBuf>,
+ }
+ 
+ /// The kernel's side of file watching, as far as the real watcher code above
+@@ -1911,6 +1925,7 @@ impl FakeFs {
+             trash: Mutex::new(SlotMap::with_key()),
+             remove_dir_errors: Default::default(),
+             case_sensitive: true,
++            network_volume_prefixes: Vec::new(),
+         }));
+         let native_watcher = fs_watcher::OsWatcher::with_backend(
+             fs_watcher::OsWatcherKind::Native,
+@@ -1952,6 +1967,17 @@ impl FakeFs {
+         self.state.lock().case_sensitive = case_sensitive;
+     }
+ 
++    /// 指定した接頭辞の配下をネットワークボリュームとして扱う。
++    ///
++    /// worktree は「ボリュームごと到達できない」と「ファイルが削除された」を分岐させるために
++    /// volume の種別を必要とする。フェイク filesystem では実際にマウントを解かずにその状態を作る。
++    pub fn set_network_volume_prefixes(&self, prefixes: impl IntoIterator<Item = impl AsRef<Path>>) {
++        self.state.lock().network_volume_prefixes = prefixes
++            .into_iter()
++            .map(|prefix| normalize_path(prefix.as_ref()))
++            .collect();
++    }
++
+     pub fn set_next_mtime(&self, next_mtime: SystemTime) {
+         let mut state = self.state.lock();
+         state.next_mtime = next_mtime;
+@@ -3550,6 +3576,15 @@ impl Fs for FakeFs {
+         false
+     }
+ 
++    fn is_on_network_volume(&self, path: &Path) -> bool {
++        let path = normalize_path(path);
++        let state = self.state.lock();
++        state
++            .network_volume_prefixes
++            .iter()
++            .any(|prefix| path.starts_with(prefix))
++    }
++
+     fn is_fake(&self) -> bool {
+         true
+     }
+diff --git a/crates/fs/src/fs_watcher.rs b/crates/fs/src/fs_watcher.rs
+index 265dee4..0147fd6 100644
+--- a/crates/fs/src/fs_watcher.rs
++++ b/crates/fs/src/fs_watcher.rs
+@@ -308,19 +308,28 @@ pub fn requires_poll_watcher(path: &Path) -> bool {
+         _ => {}
+     }
+ 
++    detect_requires_poll_watcher(path)
++}
++
++/// 設定や環境変数を見ずに、その場所がネットワーク共有・FUSE 上かを判定する。
++///
++/// 「監視に poll が必要か」と「そもそもネットワークボリュームか」は同じ OS 情報から分かるが、
++/// worktree は後者だけを必要とする。前者は設定で上書きされるので、切断の判定に使うと
++/// `file_watcher_use_polling: true` の利用者のローカルファイルまで影響してしまう。
++fn detect_requires_poll_watcher(path: &Path) -> bool {
+     #[cfg(target_os = "linux")]
+     {
+-        return detect_requires_poll_watcher_linux(path);
++        detect_requires_poll_watcher_linux(path)
+     }
+ 
+     #[cfg(target_os = "macos")]
+     {
+-        return detect_requires_poll_watcher_macos(path);
++        detect_requires_poll_watcher_macos(path)
+     }
+ 
+     #[cfg(target_os = "windows")]
+     {
+-        return detect_requires_poll_watcher_windows(path);
++        detect_requires_poll_watcher_windows(path)
+     }
+ 
+     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+@@ -330,6 +339,58 @@ pub fn requires_poll_watcher(path: &Path) -> bool {
+     }
+ }
+ 
++/// ネットワーク共有や automount が置かれる場所。これらの下のパスが到達できないときは、
++/// ファイルが消えたと受け取るより、ボリュームごと消えたと受け取る方が正しい。
++/// macOS は /Volumes と /net、Linux の automounter は /mnt・/media・/net を使う。
++#[cfg(not(target_os = "windows"))]
++const NETWORK_MOUNT_PARENTS: [&str; 4] = ["/Volumes", "/net", "/mnt", "/media"];
++
++/// UNC 共有の区切り。Windows では `\\host\share` の形でネットワーク共有を指す。
++#[cfg(target_os = "windows")]
++const UNC_PATH_PREFIX: &str = r"\\";
++
++/// その場所がネットワーク共有・FUSE マウント上にあるかを調べる。
++///
++/// SMB のマウントが解けると volume の配下は statfs すら失敗する。macOS では未マウントの
++/// 起動時に ENOENT、スリープ明けに ENOTCONN が出るため、errno だけでは「ボリュームが消えた」
++/// と「ファイルが削除された」を区別できない。到達できる場所を辿って volume の種別で見分け、
++/// 到達できる場所が一つもない場合はマウント置き場の形で見分ける。
++pub fn is_on_network_volume(fs: &dyn Fs, path: &Path) -> bool {
++    if is_expected_network_mount_path(path) {
++        return true;
++    }
++
++    let mut candidate = path;
++    loop {
++        if detect_requires_poll_watcher(candidate) {
++            return true;
++        }
++        // 到達できるのにネットワーク由来ではないなら、それより下流もローカルだと分かる。
++        if fs.path_exists(candidate) {
++            return false;
++        }
++        let Some(parent) = candidate.parent() else {
++            return false;
++        };
++        candidate = parent;
++    }
++}
++
++/// マウント置き場に置かれた形のパスか。到達できない場所の判別に使う。
++fn is_expected_network_mount_path(path: &Path) -> bool {
++    #[cfg(not(target_os = "windows"))]
++    {
++        NETWORK_MOUNT_PARENTS
++            .iter()
++            .any(|mount_parent| path.starts_with(mount_parent))
++    }
++
++    #[cfg(target_os = "windows")]
++    {
++        path.starts_with(UNC_PATH_PREFIX)
++    }
++}
++
+ /// `GetDriveTypeW` that returns this value is reporting a mapped network drive or a
+ /// UNC share, where ReadDirectoryChangesW does not reliably deliver events.
+ #[cfg(target_os = "windows")]
+@@ -1577,6 +1638,48 @@ mod tests {
+         assert!(!detect_requires_poll_watcher_macos(temp_dir.path()));
+     }
+ 
++    /// マウント置き場の形を持つ場所だけを、到達できない時の判定に使う。
++    ///
++    /// ここを間違えると、通常のローカルファイルが消えた場合に worktree を待機状態にしてしまい、
++    /// 閉じるはずのタブが残り続ける。
++    #[cfg(not(target_os = "windows"))]
++    #[test]
++    fn test_network_mount_parents_only_match_mount_locations() {
++        for path in [
++            "/Volumes/Home/.claude/settings.json",
++            "/net/server/share/file.txt",
++            "/mnt/nas/file.txt",
++            "/media/usb/file.txt",
++        ] {
++            assert!(
++                is_expected_network_mount_path(Path::new(path)),
++                "{path} はマウント置き場として扱う"
++            );
++        }
++        for path in [
++            "/Users/me/settings.json",
++            "/VolumesPrivate/file.txt",
++            "/mnt2/file.txt",
++            "/medias/file.txt",
++        ] {
++            assert!(
++                !is_expected_network_mount_path(Path::new(path)),
++                "{path} はマウント置き場ではない"
++            );
++        }
++    }
++
++    /// Windows では UNC 共有だけをマウント置き場として扱う。ドライブ文字そのものは
++    /// 到達できる volume の種別で判断する。
++    #[cfg(target_os = "windows")]
++    #[test]
++    fn test_unc_paths_are_mount_locations_on_windows() {
++        assert!(is_expected_network_mount_path(Path::new(
++            r"\\server\share\file.txt"
++        )));
++        assert!(!is_expected_network_mount_path(Path::new(r"C:\Users\me\f.txt")));
++    }
++
+     /// 設定での上書きが既定値（環境変数込み）に対する優先度を持つことを確認する。
+     #[test]
+     fn test_poll_watcher_interval_override() {
+diff --git a/crates/fs/tests/integration/fs_tests.rs b/crates/fs/tests/integration/fs_tests.rs
+index 7f38d25..2cbd875 100644
+--- a/crates/fs/tests/integration/fs_tests.rs
++++ b/crates/fs/tests/integration/fs_tests.rs
+@@ -554,6 +554,23 @@ async fn test_realfs_file_watch_mode_override(executor: BackgroundExecutor) {
+     );
+ }
+ 
++/// ローカル volume はネットワークボリュームとして扱わず、マウント置き場の形だけを
++/// 到達できない volume として扱うことを確認する。
++#[gpui::test]
++async fn test_realfs_network_volume_detection(executor: BackgroundExecutor) {
++    let fs = RealFs::new(None, executor);
++    let temp_dir = TempDir::new().unwrap();
++
++    // statfs できる場所なので、種別で「ローカル」と分かる。
++    assert!(!fs.is_on_network_volume(temp_dir.path()));
++
++    #[cfg(not(target_os = "windows"))]
++    {
++        // マウントが解けた共有はこの形になる。stat できないので、場所の形で判断する。
++        assert!(fs.is_on_network_volume(Path::new("/Volumes/zed-test-share/file.txt")));
++    }
++}
++
+ #[gpui::test]
+ async fn test_rename(executor: BackgroundExecutor) {
+     let fs = FakeFs::new(executor.clone());
+diff --git a/crates/project/src/buffer_store.rs b/crates/project/src/buffer_store.rs
+index 6e3a570..7eca6b3 100644
+--- a/crates/project/src/buffer_store.rs
++++ b/crates/project/src/buffer_store.rs
+@@ -455,15 +455,73 @@ impl LocalBufferStore {
+         cx: &mut Context<BufferStore>,
+     ) {
+         cx.subscribe(worktree, |this, worktree, event, cx| {
+-            if worktree.read(cx).is_local()
+-                && let worktree::Event::UpdatedEntries(changes) = event
+-            {
+-                Self::local_worktree_entries_changed(this, &worktree, changes, cx);
++            if !worktree.read(cx).is_local() {
++                return;
++            }
++            match event {
++                worktree::Event::UpdatedEntries(changes) => {
++                    Self::local_worktree_entries_changed(this, &worktree, changes, cx);
++                }
++                // root の entry は snapshot の diff に現れない（`build_diff` は root を飛ばす）ので、
++                // volume が消えた・戻ったことは worktree の状態から直接バッファに写す。
++                worktree::Event::RootUnavailable | worktree::Event::RootAvailable => {
++                    Self::local_worktree_root_availability_changed(this, &worktree, cx);
++                }
++                _ => {}
+             }
+         })
+         .detach();
+     }
+ 
++    /// root を含む volume が到達できない/再び到達できることを、開いているバッファの `File` に写す。
++    ///
++    /// 到達できない間は「ディスク上に無い」ファイルとして扱うので、空の内容で共有を覆ってしまう
++    /// 保存を防げる。戻った時は snapshot の各パスの entry を読み直すことで
++    /// `Buffer::file_updated` が `ReloadNeeded` を出し、ディスク上の内容が正になる。
++    fn local_worktree_root_availability_changed(
++        this: &mut BufferStore,
++        worktree_handle: &Entity<Worktree>,
++        cx: &mut Context<BufferStore>,
++    ) {
++        let worktree_id = worktree_handle.read(cx).id();
++        let unavailable = worktree_handle.read(cx).root_unavailable();
++        let snapshot = worktree_handle.read(cx).snapshot();
++
++        let buffers = this
++            .opened_buffers
++            .values()
++            .filter_map(OpenBuffer::upgrade)
++            .collect::<Vec<_>>();
++
++        for buffer in buffers {
++            buffer.update(cx, |buffer, cx| {
++                let Some(old_file) = File::from_dyn(buffer.file()) else {
++                    return;
++                };
++                if old_file.worktree_id(cx) != worktree_id {
++                    return;
++                }
++
++                // 本文はそのままで状態だけ書き換える。entry が無い場合は、その場所が
++                // まだ到達できないままだと読む。
++                let entry = if unavailable {
++                    None
++                } else {
++                    snapshot.entry_for_path(old_file.path()).cloned()
++                };
++                let new_file = match entry {
++                    Some(entry) => File::for_entry(entry, worktree_handle.clone()),
++                    None => Arc::new(File {
++                        disk_state: DiskState::Deleted,
++                        ..old_file.clone()
++                    }),
++                };
++
++                buffer.file_updated(new_file, cx);
++            });
++        }
++    }
++
+     fn local_worktree_entries_changed(
+         this: &mut BufferStore,
+         worktree_handle: &Entity<Worktree>,
+@@ -717,7 +775,17 @@ impl LocalBufferStore {
+                         buffer
+                     })
+                 }
+-                Err(error) if is_not_found_error(&error) => cx.new(|cx| {
++                Err(error) if is_not_found_error(&error) => {
++                    // 到達できない volume の上では、ファイルが消えたのか共有が戻るのを待って
++                    // いるのかを区別できない。新規の空ファイルとして扱うと、そのまま保存して
++                    // 共有側を空で覆ってしまう。削除済みとして扱う。
++                    let disk_state = if worktree.read_with(cx, |worktree, _| worktree.root_unavailable())
++                    {
++                        DiskState::Deleted
++                    } else {
++                        DiskState::New
++                    };
++                    cx.new(|cx| {
+                     let buffer_id = BufferId::from(cx.entity_id().as_non_zero_u64());
+                     let text_buffer = text::Buffer::new(ReplicaId::LOCAL, buffer_id, "");
+                     let mut buffer = Buffer::build(
+@@ -725,7 +793,7 @@ impl LocalBufferStore {
+                         Some(Arc::new(File {
+                             worktree,
+                             path,
+-                            disk_state: DiskState::New,
++                            disk_state,
+                             entry_id: None,
+                             is_local: true,
+                             is_private: false,
+@@ -735,7 +803,8 @@ impl LocalBufferStore {
+                     );
+                     apply_initial_line_ending(&mut buffer, cx);
+                     buffer
+-                }),
++                    })
++                }
+                 Err(e) => return Err(e),
+             };
+             this.update(cx, |this, cx| {
+@@ -843,8 +912,17 @@ impl BufferStore {
+                 worktree_store: worktree_store.clone(),
+                 _subscription: cx.subscribe(&worktree_store, |this, _, event, cx| {
+                     if let WorktreeStoreEvent::WorktreeAdded(worktree) = event {
+-                        let this = this.as_local_mut().unwrap();
+-                        this.subscribe_to_worktree(worktree, cx);
++                        // 起動時に volume へ到達できない worktree では `RootUnavailable` がこの
++                        // 購読より前に発行済みなので、現在の状態から直接適用する。
++                        let root_unavailable = worktree.read(cx).root_unavailable();
++                        if let Some(local) = this.as_local_mut() {
++                            local.subscribe_to_worktree(worktree, cx);
++                            if root_unavailable {
++                                LocalBufferStore::local_worktree_root_availability_changed(
++                                    this, worktree, cx,
++                                );
++                            }
++                        }
+                     }
+                 }),
+             }),
+diff --git a/crates/project/src/lsp_store.rs b/crates/project/src/lsp_store.rs
+index 6c7c4a2..28ee124 100644
+--- a/crates/project/src/lsp_store.rs
++++ b/crates/project/src/lsp_store.rs
+@@ -5103,6 +5103,10 @@ impl LspStore {
+                     worktree::Event::UpdatedGitRepositories(_)
+                     | worktree::Event::DeletedEntry(_)
+                     | worktree::Event::Deleted
++                    // root を含む volume が消えた/戻った場合は worktree 自体が生きたままなので、
++                    // 言語サーバーの停止・再開は worktree の復旧処理に任せる。
++                    | worktree::Event::RootUnavailable
++                    | worktree::Event::RootAvailable
+                     | worktree::Event::UpdatedRootRepoCommonDir { .. } => {}
+                 })
+                 .detach()
+diff --git a/crates/project/src/manifest_tree.rs b/crates/project/src/manifest_tree.rs
+index 8c28601..b238542 100644
+--- a/crates/project/src/manifest_tree.rs
++++ b/crates/project/src/manifest_tree.rs
+@@ -59,7 +59,12 @@ impl WorktreeRoots {
+                         let path = TriePath::from(entry.path.as_ref());
+                         this.roots.remove(&path);
+                     }
+-                    WorktreeEvent::Deleted | WorktreeEvent::UpdatedRootRepoCommonDir { .. } => {}
++                    // root を含む volume が消えた場合も manifest の root 自体は有効なまま
++                    // 残す（復旧後に通常の UpdatedEntries で更新される）。
++                    WorktreeEvent::RootUnavailable
++                    | WorktreeEvent::RootAvailable
++                    | WorktreeEvent::Deleted
++                    | WorktreeEvent::UpdatedRootRepoCommonDir { .. } => {}
+                 }
+             }),
+         })
+diff --git a/crates/project/src/worktree_store.rs b/crates/project/src/worktree_store.rs
+index 300d9cf..7efb5ee 100644
+--- a/crates/project/src/worktree_store.rs
++++ b/crates/project/src/worktree_store.rs
+@@ -995,6 +995,10 @@ impl WorktreeStore {
+                     // The worktree root itself has been deleted (for single-file worktrees)
+                     // The worktree will be removed via the observe_release callback
+                 }
++                worktree::Event::RootUnavailable | worktree::Event::RootAvailable => {
++                    // root を含む volume が到達できない/戻った状態で、worktree は閉じない。
++                    // 開いているバッファの扱いは `LocalBufferStore` が worktree を直接購読して決める。
++                }
+                 worktree::Event::UpdatedRootRepoCommonDir { .. } => {
+                     cx.emit(WorktreeStoreEvent::WorktreeUpdatedRootRepoCommonDir(
+                         worktree_id,
+diff --git a/crates/project/tests/integration/project_tests.rs b/crates/project/tests/integration/project_tests.rs
+index f4642a3..13003b9 100644
+--- a/crates/project/tests/integration/project_tests.rs
++++ b/crates/project/tests/integration/project_tests.rs
+@@ -9536,6 +9536,82 @@ async fn test_dirty_buffer_reloads_after_undo(cx: &mut gpui::TestAppContext) {
+     });
+ }
+ 
++/// SMB の共有ごと到達できなくなった時に、開いているバッファの本文を保ち、共有が戻ったら
++/// ディスク上の内容を正にすることを確認する。
++#[gpui::test]
++async fn test_buffer_waits_with_its_network_volume_and_rereads_it(cx: &mut gpui::TestAppContext) {
++    init_test(cx);
++
++    let fs = FakeFs::new(cx.executor());
++    fs.set_network_volume_prefixes([path!("/Volumes/Home")]);
++    fs.insert_tree(
++        path!("/Volumes/Home"),
++        json!({
++            "notes.txt": "content on the share",
++        }),
++    )
++    .await;
++
++    let project = Project::test(fs.clone(), [path!("/Volumes/Home/notes.txt").as_ref()], cx).await;
++    let buffer = project
++        .update(cx, |project, cx| {
++            project.open_local_buffer(path!("/Volumes/Home/notes.txt"), cx)
++        })
++        .await
++        .unwrap();
++    cx.run_until_parked();
++
++    buffer.read_with(cx, |buffer, _| {
++        assert_eq!(buffer.text(), "content on the share");
++        assert!(!buffer.is_dirty());
++    });
++
++    // 共有ごと消える（スリープで SMB のマウントが解れたのと同じ）。
++    fs.pause_events();
++    fs.remove_file(path!("/Volumes/Home/notes.txt").as_ref(), Default::default())
++        .await
++        .unwrap();
++    fs.remove_dir(path!("/Volumes/Home").as_ref(), Default::default())
++        .await
++        .unwrap();
++    fs.unpause_events_and_flush();
++    cx.run_until_parked();
++
++    buffer.read_with(cx, |buffer, _| {
++        assert_eq!(
++            buffer.text(),
++            "content on the share",
++            "共有に到達できない間も本文はそのまま保つ"
++        );
++        assert!(
++            buffer.file().unwrap().disk_state().is_deleted(),
++            "ディスク上に見えないファイルとして扱う"
++        );
++    });
++
++    // 共有が戻った。その中のファイルが変わっていれば、そちらを正にする。
++    fs.insert_tree(
++        path!("/Volumes/Home"),
++        json!({
++            "notes.txt": "content written while we were away",
++        }),
++    )
++    .await;
++    // 復旧を確認する間隔（2 秒）を超える分を進める。
++    cx.executor()
++        .advance_clock(std::time::Duration::from_secs(3));
++    cx.run_until_parked();
++
++    buffer.read_with(cx, |buffer, _| {
++        assert_eq!(
++            buffer.text(),
++            "content written while we were away",
++            "共有が戻ったらディスクの内容を正にする"
++        );
++        assert!(!buffer.is_dirty(), "ユーザーが編集していないので dirty にはしない");
++    });
++}
++
+ #[gpui::test]
+ async fn test_buffer_file_change_to_binary_fails(cx: &mut gpui::TestAppContext) {
+     init_test(cx);
+diff --git a/crates/workspace/src/pane.rs b/crates/workspace/src/pane.rs
+index 25771a8..f137bb9 100644
+--- a/crates/workspace/src/pane.rs
++++ b/crates/workspace/src/pane.rs
+@@ -2254,6 +2254,13 @@ impl Pane {
+ 
+         const DELETED_MESSAGE: &str = "This file has been deleted on disk since you started editing it. Do you want to recreate it?";
+ 
++        // 到達できない共有の上では書き込みそのものが失敗する。ここで「削除された」と伝えても
++        // 誤解になるので、接続が切れていることをそのまま伝える。
++        const DISCONNECTED_SHARE_MESSAGE: &str =
++            "The network share holding this file is disconnected. Do you want to try saving it anyway?";
++        const DISCONNECTED_SHARE_DETAIL: &str =
++            "Zed will read the file again when the share is connected.";
++
+         let path_style = project.read_with(cx, |project, cx| project.path_style(cx));
+         if save_intent == SaveIntent::Skip {
+             let is_saveable_singleton = cx.update(|_window, cx| {
+@@ -2285,7 +2292,9 @@ impl Pane {
+             can_save_as,
+             is_singleton,
+             has_deleted_file,
++            share_disconnected,
+         ) = cx.update(|_window, cx| {
++            let project_path = item.project_path(cx);
+             (
+                 item.has_conflict(cx),
+                 item.is_dirty(cx),
+@@ -2293,6 +2302,12 @@ impl Pane {
+                 item.can_save_as(cx),
+                 item.buffer_kind(cx) == ItemBufferKind::Singleton,
+                 item.has_deleted_file(cx),
++                project_path.is_some_and(|project_path| {
++                    project
++                        .read(cx)
++                        .worktree_for_id(project_path.worktree_id, cx)
++                        .is_some_and(|worktree| worktree.read(cx).root_unavailable())
++                }),
+             )
+         })?;
+ 
+@@ -2317,6 +2332,32 @@ impl Pane {
+         let should_format = save_intent != SaveIntent::SaveWithoutFormat;
+         let force_format = save_intent == SaveIntent::FormatAndSave;
+ 
++        // 到達できない共有への保存は失敗するので、まずその旨を伝える。共有が戻ると Zed が
++        // 読み直すので、ここで保存を試る必要はない。明示的な保存操作にだけ応じる。
++        if share_disconnected
++            && is_singleton
++            && can_save
++            && matches!(
++                save_intent,
++                SaveIntent::Save | SaveIntent::FormatAndSave | SaveIntent::SaveWithoutFormat
++            )
++        {
++            let answer = pane.update_in(cx, |pane, window, cx| {
++                pane.activate_item(item_ix, true, true, window, cx);
++                window.prompt(
++                    PromptLevel::Warning,
++                    DISCONNECTED_SHARE_MESSAGE,
++                    Some(DISCONNECTED_SHARE_DETAIL),
++                    &["Save", "Cancel"],
++                    cx,
++                )
++            })?;
++            match answer.await {
++                Ok(0) => {}
++                _ => return Ok(false),
++            }
++        }
++
+         if has_conflict && can_save {
+             if has_deleted_file && is_singleton {
+                 let answer = pane.update_in(cx, |pane, window, cx| {
+diff --git a/crates/worktree/src/worktree.rs b/crates/worktree/src/worktree.rs
+index 8d5477f..732f3f1 100644
+--- a/crates/worktree/src/worktree.rs
++++ b/crates/worktree/src/worktree.rs
+@@ -154,6 +154,11 @@ pub struct LocalWorktree {
+     share_private_files: bool,
+     scanning_enabled: bool,
+     force_defer_watch: bool,
++    /// root に到達できない状態かどうか。ネットワーク共有のマウントが解けた時に立って、
++    /// root が現れたら消える。開いているバッファの内容はそのまま保たれる。
++    root_unavailable: bool,
++    /// 到達できない root が再び現れたかを確かめるタスク。現れたら停止する。
++    root_availability_task: Option<Task<()>>,
+ }
+ 
+ pub struct PathPrefixScanRequest {
+@@ -447,6 +452,21 @@ impl DerefMut for LocalSnapshot {
+     }
+ }
+ 
++/// マウントが解けたネットワークボリュームが戻ったかを確かめる間隔。
++/// 復旧は OS が行うので Zed が調べに行くが、stat 1 回をこの間隔で見る程度に留める。
++const ROOT_AVAILABILITY_RETRY_INTERVAL: Duration = Duration::from_secs(2);
++
++/// `path` が置かれた volume ごと到達できないのかを調べる。
++///
++/// macOS で SMB のマウントが解けると `/Volumes/<共有>` への stat まで失敗する。親に到達できるのに
++/// `path` だけが無いなら「ファイルが削除された」なので、従来どおり worktree を閉じる側へ寄せる。
++fn volume_of_path_is_unreachable(fs: &dyn Fs, path: &Path) -> bool {
++    let Some(parent) = path.parent() else {
++        return false;
++    };
++    !fs.path_exists(parent) && fs.is_on_network_volume(path)
++}
++
+ enum ScanState {
+     Started,
+     Updated {
+@@ -459,6 +479,8 @@ enum ScanState {
+         new_path: Arc<SanitizedPath>,
+     },
+     RootDeleted,
++    /// root に到達できないが、その volume が戻るのを待っている。
++    RootUnavailable,
+ }
+ 
+ struct UpdateObservationState {
+@@ -477,6 +499,10 @@ pub enum Event {
+     DeletedEntry(ProjectEntryId),
+     /// The worktree root itself has been deleted (for single-file worktrees)
+     Deleted,
++    /// root が置かれた volume ごと到達できない。復旧を待っている間も worktree は開いたまま。
++    RootUnavailable,
++    /// 到達できなかった root が再び現れた。snapshot の root entry は読み直されている。
++    RootAvailable,
+ }
+ 
+ impl EventEmitter<Event> for Worktree {}
+@@ -492,10 +518,20 @@ impl Worktree {
+         cx: &mut AsyncApp,
+     ) -> Result<Entity<Self>> {
+         let abs_path = path.into();
+-        let metadata = fs
+-            .metadata(&abs_path)
+-            .await
+-            .context("failed to stat worktree path")?;
++        // 到達できなくなった共有への stat は ENOTCONN のようなエラーで返る。ネットワーク共有では
++        // 「消えた」ように見えても戻るので、存在しない場合と同じ扱いにして復旧を待つ。
++        let metadata = match fs.metadata(&abs_path).await {
++            Ok(metadata) => metadata,
++            Err(error) if fs.is_on_network_volume(&abs_path) => {
++                log::warn!("worktree root {abs_path:?} is unreachable: {error:#}");
++                None
++            }
++            Err(error) => {
++                return Err(error).context("failed to stat worktree path");
++            }
++        };
++        let wait_for_root_return =
++            metadata.is_none() && volume_of_path_is_unreachable(fs.as_ref(), &abs_path);
+ 
+         let fs_case_sensitive = fs.is_case_sensitive().await;
+ 
+@@ -611,8 +647,19 @@ impl Worktree {
+                 settings,
+                 scanning_enabled,
+                 force_defer_watch: false,
++                root_unavailable: false,
++                root_availability_task: None,
+             };
+             worktree.start_background_scanner(scan_requests_rx, path_prefixes_to_scan_rx, cx);
++
++            // 起動時に SMB がまだ繋がっていないと root 自体が存在しない。ファイルが消えた場合と
++            // は違い volume は戻る可能性があるので、復旧を待つ状態から始める。
++            // ここでは worktree を購読する側に状態を読む機会があるので、イベントは送らない。
++            if wait_for_root_return {
++                worktree.root_unavailable = true;
++                worktree.start_waiting_for_root_return(cx);
++            }
++
+             Worktree::Local(worktree)
+         }))
+     }
+@@ -1276,6 +1323,17 @@ impl Worktree {
+         self.root_dir().is_none()
+     }
+ 
++    /// root に現在到達できない状態か。ネットワーク共有のマウントが解けた時に立つ。
++    ///
++    /// 開いているバッファとその本文はそのまま保たれ、タブにはその状態が表示される。
++    /// 遠隔 worktree の切断は `remote::ConnectionState` が担うので、常に false。
++    pub fn root_unavailable(&self) -> bool {
++        match self {
++            Worktree::Local(local) => local.root_unavailable,
++            Worktree::Remote(_) => false,
++        }
++    }
++
+     /// For visible worktrees, returns the path with the worktree name as the first component.
+     /// Otherwise, returns an absolute path.
+     pub fn full_path(&self, worktree_relative_path: &RelPath) -> PathBuf {
+@@ -1426,6 +1484,13 @@ impl LocalWorktree {
+                         ScanState::RootUpdated { new_path } => {
+                             this.update_abs_path_and_refresh(new_path, cx);
+                         }
++                        ScanState::RootUnavailable => {
++                            log::info!(
++                                "worktree root {} is unreachable on a network volume, keeping it open until it returns",
++                                this.abs_path().display()
++                            );
++                            this.mark_root_unavailable(cx);
++                        }
+                         ScanState::RootDeleted => {
+                             log::info!(
+                                 "worktree root {} no longer exists, closing worktree",
+@@ -2234,11 +2299,96 @@ impl LocalWorktree {
+         self.restart_background_scanners(cx);
+     }
+ 
++    /// root が現れたかを定期的に確かめるタスクを開始する。
++    ///
++    /// 復旧は OS が行うので、Zed が自分から確認しに行くしかない。監視登録は root が消えた後に
++    /// 復旧を約束しないため、現れたら entries を読み直して、通常の「ディスクの内容を正にする」
++    /// 経路（`file_updated` -> `ReloadNeeded`）に載せる。
++    fn start_waiting_for_root_return(&mut self, cx: &mut Context<Worktree>) {
++        let fs = self.fs.clone();
++        let root_abs_path: Arc<Path> = self.abs_path().clone();
++
++        self.root_availability_task = Some(cx.spawn(async move |this, cx| {
++            loop {
++                cx.background_executor()
++                    .timer(ROOT_AVAILABILITY_RETRY_INTERVAL)
++                    .await;
++                let Some(worktree) = this.upgrade() else { return };
++                let still_waiting = worktree.read_with(cx, |worktree, _| {
++                    worktree
++                        .as_local()
++                        .is_some_and(|local| local.root_unavailable)
++                });
++                if !still_waiting {
++                    return;
++                }
++
++                // dead な共有への stat は応答しないことがあるので、前景スレッドでは調べない。
++                let metadata = match fs.metadata(&root_abs_path).await {
++                    Ok(Some(metadata)) => metadata,
++                    Ok(None) => continue,
++                    Err(error) => {
++                        log::debug!(
++                            "waiting for {} to become reachable: {error:#}",
++                            root_abs_path.display()
++                        );
++                        continue;
++                    }
++                };
++                let root_is_dir = metadata.is_dir;
++
++                // root の entry を作り直す。再読み込みを待たないと、古い entry のまま
++                // 「戻った」ことになってしまう。フォルダだった場合は中の entries ごと
++                // 読み直す必要があるので、root だけの再読み込みでは足りない。
++                let barrier = worktree.update(cx, |worktree, _| {
++                    let Some(local) = worktree.as_local_mut() else {
++                        return None;
++                    };
++                    if root_is_dir {
++                        Some(local.add_path_prefix_to_scan(RelPath::empty_arc()))
++                    } else {
++                        Some(local.refresh_entries_for_paths(vec![RelPath::empty_arc()]))
++                    }
++                });
++                if let Some(mut barrier) = barrier {
++                    barrier.recv().await;
++                }
++
++                let Some(worktree) = this.upgrade() else {
++                    return;
++                };
++                worktree.update(cx, |worktree, cx| {
++                    let Some(local) = worktree.as_local_mut() else {
++                        return;
++                    };
++                    local.root_unavailable = false;
++                    cx.emit(Event::RootAvailable);
++                    cx.notify();
++                });
++                return;
++            }
++        }));
++    }
++
++    /// root が属する volume へ到達できなくなったことを伝えて、復旧を待ち始める。
++    fn mark_root_unavailable(&mut self, cx: &mut Context<Worktree>) {
++        self.root_unavailable = true;
++        // 前に待機していたタスクがあれば破棄する（破くと work は止まる）。
++        self.root_availability_task = None;
++        self.start_waiting_for_root_return(cx);
++
++        cx.emit(Event::RootUnavailable);
++        cx.notify();
++    }
++
+     pub fn update_abs_path_and_refresh(
+         &mut self,
+         new_path: Arc<SanitizedPath>,
+         cx: &Context<Worktree>,
+     ) {
++        // root が移動した = 到達できる場所に移ったので、待機は終わる。
++        self.root_unavailable = false;
++        self.root_availability_task = None;
+         self.snapshot.git_repositories = Default::default();
+         self.snapshot.ignores_by_parent_abs_path = Default::default();
+         let root_name = new_path
+@@ -4837,17 +4987,35 @@ impl BackgroundScanner {
+             // For single-file worktrees, if we can't canonicalize and the file handle
+             // fallback also failed, the file is gone - close the worktree
+             if self.is_single_file {
+-                log::info!(
+-                    "single-file worktree root {:?} no longer exists, marking as deleted",
+-                    root_path.as_path()
+-                );
+-                self.status_updates_tx
+-                    .unbounded_send(ScanState::RootDeleted)
+-                    .ok();
++                if self.root_volume_is_unreachable(root_path.as_path()) {
++                    log::info!(
++                        "single-file worktree root {:?} is unreachable because its volume is gone, waiting for it to return",
++                        root_path.as_path()
++                    );
++                    self.status_updates_tx
++                        .unbounded_send(ScanState::RootUnavailable)
++                        .ok();
++                } else {
++                    log::info!(
++                        "single-file worktree root {:?} no longer exists, marking as deleted",
++                        root_path.as_path()
++                    );
++                    self.status_updates_tx
++                        .unbounded_send(ScanState::RootDeleted)
++                        .ok();
++                }
+             }
+         }
+     }
+ 
++    /// root が置かれた volume ごと到達できない状態かを調べる。
++    ///
++    /// 共有が生きているのにファイルだけ消えた場合は false にして、従来どおり「削除」として
++    /// 扱う。errno だけでは分けられないので、親に到達できるかとその場所の種別で判断する。
++    fn root_volume_is_unreachable(&self, root_path: &Path) -> bool {
++        volume_of_path_is_unreachable(self.fs.as_ref(), root_path)
++    }
++
+     async fn process_events(&self, mut events: Vec<PathEvent>) {
+         let root_path = self.state.lock().await.snapshot.abs_path.clone();
+         let root_canonical_path = match self.fs.canonicalize(root_path.as_path()).await {
+diff --git a/crates/worktree/tests/integration/worktree_tests.rs b/crates/worktree/tests/integration/worktree_tests.rs
+index 15a8808..db740e3 100644
+--- a/crates/worktree/tests/integration/worktree_tests.rs
++++ b/crates/worktree/tests/integration/worktree_tests.rs
+@@ -6389,6 +6389,192 @@ async fn test_single_file_worktree_deleted(cx: &mut TestAppContext) {
+     );
+ }
+ 
++/// SMB の共有ごと消えた時に、single-file worktree は閉じずに復旧を待つことを確認する。
++/// 閉じてしまうと、開いていたバッファの本文ごと失われる（スリープで共有が切れる状況）。
++#[gpui::test]
++async fn test_single_file_worktree_waits_for_network_volume_to_return(cx: &mut TestAppContext) {
++    init_test(cx);
++    let fs = FakeFs::new(cx.background_executor.clone());
++    fs.set_network_volume_prefixes([path!("/Volumes/Home")]);
++    fs.insert_tree(
++        path!("/Volumes/Home"),
++        json!({
++            "notes.txt": "before sleep",
++        }),
++    )
++    .await;
++
++    let tree = Worktree::local(
++        PathBuf::from(path!("/Volumes/Home/notes.txt")),
++        true,
++        fs.clone(),
++        Default::default(),
++        true,
++        WorktreeId::from_proto(0),
++        &mut cx.to_async(),
++    )
++    .await
++    .unwrap();
++    cx.read(|cx| tree.read(cx).as_local().unwrap().scan_complete())
++        .await;
++    cx.read(|cx| assert!(!tree.read(cx).root_unavailable(), "開いた直後は到達できる"));
++
++    let deleted_event = Rc::new(Cell::new(false));
++    let unavailable_events = Rc::new(Cell::new(0));
++    let available_events = Rc::new(Cell::new(0));
++    let _subscription = cx.update({
++        let deleted_event = deleted_event.clone();
++        let unavailable_events = unavailable_events.clone();
++        let available_events = available_events.clone();
++        |cx| {
++            cx.subscribe(&tree, move |_, event, _| match event {
++                Event::Deleted => deleted_event.set(true),
++                Event::RootUnavailable => {
++                    unavailable_events.set(unavailable_events.get() + 1);
++                }
++                Event::RootAvailable => {
++                    available_events.set(available_events.get() + 1);
++                }
++                _ => {}
++            })
++        }
++    });
++
++    // 共有ごと消える。イベントが出る前に削除し終えて、親に到達できない状態にする。
++    fs.pause_events();
++    fs.remove_file(Path::new(path!("/Volumes/Home/notes.txt")), Default::default())
++        .await
++        .unwrap();
++    fs.remove_dir(Path::new(path!("/Volumes/Home")), Default::default())
++        .await
++        .unwrap();
++    fs.unpause_events_and_flush();
++    cx.background_executor.run_until_parked();
++
++    assert!(
++        !deleted_event.get(),
++        "volume ごと到達できない時に Deleted が出ると worktree が閉じられる"
++    );
++    assert_eq!(
++        unavailable_events.get(),
++        1,
++        "RootUnavailable が出ていなければ復旧を待つ task が始まらない"
++    );
++    cx.read(|cx| assert!(tree.read(cx).root_unavailable()));
++
++    // 共有が戻った。復旧を確認する間隔（2 秒）を超える分を進める。
++    fs.insert_tree(
++        path!("/Volumes/Home"),
++        json!({
++            "notes.txt": "after the share was mounted again",
++        }),
++    )
++    .await;
++    cx.background_executor
++        .advance_clock(std::time::Duration::from_secs(3));
++    cx.background_executor.run_until_parked();
++
++    assert_eq!(
++        available_events.get(),
++        1,
++        "root が現れたことを worktree が伝えなければならない"
++    );
++    cx.read(|cx| assert!(!tree.read(cx).root_unavailable()));
++    tree.read_with(cx, |tree, _| {
++        let root_entry = tree
++            .root_entry()
++            .expect("root の entry が作り直されているはず");
++        assert!(
++            root_entry.mtime.is_some(),
++            "ディスク上のファイルとして読み直されているはず"
++        );
++    });
++}
++
++/// 起動時に SMB が繋がっていないフォルダを開いた場合でも、共有が戻ったらその中まで読み直す。
++#[gpui::test]
++async fn test_worktree_opened_while_its_network_volume_is_unmounted(cx: &mut TestAppContext) {
++    init_test(cx);
++    let fs = FakeFs::new(cx.background_executor.clone());
++    fs.set_network_volume_prefixes([path!("/Volumes/Home")]);
++
++    let tree = Worktree::local(
++        PathBuf::from(path!("/Volumes/Home/project")),
++        true,
++        fs.clone(),
++        Default::default(),
++        true,
++        WorktreeId::from_proto(0),
++        &mut cx.to_async(),
++    )
++    .await
++    .unwrap();
++    cx.background_executor.run_until_parked();
++    cx.read(|cx| assert!(tree.read(cx).root_unavailable()));
++
++    fs.insert_tree(
++        path!("/Volumes/Home/project"),
++        json!({
++            "src": { "main.rs": "fn main() {}" },
++        }),
++    )
++    .await;
++    cx.background_executor
++        .advance_clock(std::time::Duration::from_secs(3));
++    cx.background_executor.run_until_parked();
++
++    cx.read(|cx| assert!(!tree.read(cx).root_unavailable()));
++    tree.read_with(cx, |tree, _| {
++        assert!(
++            tree.entry_for_path(rel_path("src/main.rs")).is_some(),
++            "共有が戻った時は root の配下まで読み直す"
++        );
++    });
++}
++
++/// 起動時に SMB がまだ繋がっていない場合でも、worktree は作れて、復旧を待つ状態から
++/// 始められることを確認する。
++#[gpui::test]
++async fn test_single_file_worktree_opened_while_its_volume_is_unmounted(cx: &mut TestAppContext) {
++    init_test(cx);
++    let fs = FakeFs::new(cx.background_executor.clone());
++    fs.set_network_volume_prefixes([path!("/Volumes/Home")]);
++
++    let tree = Worktree::local(
++        PathBuf::from(path!("/Volumes/Home/notes.txt")),
++        true,
++        fs.clone(),
++        Default::default(),
++        true,
++        WorktreeId::from_proto(0),
++        &mut cx.to_async(),
++    )
++    .await
++    .unwrap();
++    cx.background_executor.run_until_parked();
++
++    cx.read(|cx| assert!(tree.read(cx).root_unavailable()));
++
++    fs.insert_tree(
++        path!("/Volumes/Home"),
++        json!({
++            "notes.txt": "mounted by the time we looked again",
++        }),
++    )
++    .await;
++    cx.background_executor
++        .advance_clock(std::time::Duration::from_secs(3));
++    cx.background_executor.run_until_parked();
++
++    cx.read(|cx| assert!(!tree.read(cx).root_unavailable()));
++    tree.read_with(cx, |tree, _| {
++        let root_entry = tree
++            .root_entry()
++            .expect("共有が戻った後に root の entry が作られているはず");
++        assert!(root_entry.mtime.is_some());
++    });
++}
++
+ #[gpui::test]
+ async fn test_root_ancestor_rename_is_detected_without_fs_events(cx: &mut TestAppContext) {
+     init_test(cx);

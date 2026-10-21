@@ -1,0 +1,307 @@
+diff --git a/crates/zed/src/main.rs b/crates/zed/src/main.rs
+index f720fef..0001309 100644
+--- a/crates/zed/src/main.rs
++++ b/crates/zed/src/main.rs
+@@ -349,10 +349,6 @@ fn main() {
+         .background_executor()
+         .spawn(installation_id(KeyValueStore::from_app_db(&app_db)));
+     let session_id = Uuid::new_v4().to_string();
+-    let session = app.background_executor().spawn(Session::new(
+-        session_id.clone(),
+-        KeyValueStore::from_app_db(&app_db),
+-    ));
+     let background_executor = app.background_executor();
+ 
+     let (open_listener, mut open_rx) = OpenListener::new();
+@@ -383,6 +379,14 @@ fn main() {
+         return;
+     }
+ 
++    // セッション ID は「前回のセッション」復元の検索キーとしてデータベースに保存する。
++    // 自分がプライマリだと確定する前に書き込むと、二重起動したインスタンスが本当の
++    // セッション ID を置き換えてしまい、次回起動時に復元できなくなる。
++    let session = app.background_executor().spawn(Session::new(
++        session_id.clone(),
++        KeyValueStore::from_app_db(&app_db),
++    ));
++
+     let should_install_crash_handler =
+         client::telemetry::should_install_crash_handler(*release_channel::RELEASE_CHANNEL);
+ 
+@@ -1590,7 +1594,7 @@ pub(crate) async fn restorable_workspace_locations(
+     cx: &mut AsyncApp,
+     app_state: &Arc<AppState>,
+ ) -> Option<Vec<SessionWorkspace>> {
+-    let (mut restore_behavior, db) = cx.update(|cx| {
++    let (restore_behavior, db) = cx.update(|cx| {
+         (
+             WorkspaceSettings::get(None, cx).restore_on_startup,
+             workspace::WorkspaceDb::global(cx),
+@@ -1607,56 +1611,73 @@ pub(crate) async fn restorable_workspace_locations(
+         )
+     });
+ 
+-    if last_session_id.is_none()
+-        && matches!(
+-            restore_behavior,
+-            workspace::RestoreOnStartupBehavior::LastSession
+-        )
+-    {
+-        restore_behavior = workspace::RestoreOnStartupBehavior::LastWorkspace;
+-    }
+-
+     match restore_behavior {
+         workspace::RestoreOnStartupBehavior::LastWorkspace => {
+-            workspace::last_opened_workspace_location(&db, app_state.fs.as_ref())
+-                .await
+-                .map(|(workspace_id, location, paths)| {
+-                    vec![SessionWorkspace {
+-                        workspace_id,
+-                        location,
+-                        paths,
+-                        window_id: None,
+-                    }]
+-                })
++            last_opened_workspace_locations(&db, app_state).await
+         }
+         workspace::RestoreOnStartupBehavior::LastSession => {
+-            if let Some(last_session_id) = last_session_id {
+-                let ordered = last_session_window_stack.is_some();
+-
+-                let mut locations = workspace::last_session_workspace_locations(
+-                    &db,
+-                    &last_session_id,
+-                    last_session_window_stack,
+-                    app_state.fs.as_ref(),
+-                )
+-                .await
+-                .filter(|locations| !locations.is_empty());
++            let last_session_locations = match &last_session_id {
++                Some(last_session_id) => {
++                    let ordered = last_session_window_stack.is_some();
++
++                    let mut locations = workspace::last_session_workspace_locations(
++                        &db,
++                        last_session_id,
++                        last_session_window_stack,
++                        app_state.fs.as_ref(),
++                    )
++                    .await
++                    .filter(|locations| !locations.is_empty());
+ 
+-                // Since last_session_window_order returns the windows ordered front-to-back
+-                // we need to open the window that was frontmost last.
+-                if ordered && let Some(locations) = locations.as_mut() {
+-                    locations.reverse();
++                    // Since last_session_window_order returns the windows ordered front-to-back
++                    // we need to open the window that was frontmost last.
++                    if ordered && let Some(locations) = locations.as_mut() {
++                        locations.reverse();
++                    }
++
++                    locations
+                 }
++                None => None,
++            };
+ 
+-                locations
+-            } else {
+-                None
++            match last_session_locations {
++                Some(locations) => Some(locations),
++                // 保存されたセッション ID にワークスペースのレコードが対応しないのは、
++                // 別のインスタンスがセッション ID を置き換えた場合（二重起動）か、前回の
++                // セッションで実ワークスペースを開かなかった場合に限られる。何も復元せずに
++                // 空のウィンドウを開くより、最後に開いた実ワークスペースを復元する方が
++                // 有用なのでこちらに退避する。
++                None => {
++                    log::info!(
++                        "No workspaces saved for session {:?}, falling back to the last opened workspace",
++                        last_session_id
++                    );
++                    last_opened_workspace_locations(&db, app_state).await
++                }
+             }
+         }
+         _ => None,
+     }
+ }
+ 
++/// `restore_on_startup: last_session` が復元対象を見つけられなかった場合の退避先として、
++/// 最後に開いた実ワークスペース 1 件を返す。
++async fn last_opened_workspace_locations(
++    db: &workspace::WorkspaceDb,
++    app_state: &Arc<AppState>,
++) -> Option<Vec<SessionWorkspace>> {
++    workspace::last_opened_workspace_location(db, app_state.fs.as_ref())
++        .await
++        .map(|(workspace_id, location, paths)| {
++            vec![SessionWorkspace {
++                workspace_id,
++                location,
++                paths,
++                window_id: None,
++            }]
++        })
++}
++
+ fn init_paths() -> HashMap<io::ErrorKind, Vec<&'static Path>> {
+     [
+         paths::config_dir(),
+diff --git a/crates/zed/src/zed.rs b/crates/zed/src/zed.rs
+index d5ae000..1973e6f 100644
+--- a/crates/zed/src/zed.rs
++++ b/crates/zed/src/zed.rs
+@@ -7699,6 +7699,139 @@ mod tests {
+             .unwrap();
+     }
+ 
++    #[gpui::test]
++    async fn test_last_session_falls_back_to_last_workspace_when_session_id_is_orphaned(
++        cx: &mut TestAppContext,
++    ) {
++        use session::Session;
++        use workspace::{OpenMode, Workspace};
++
++        let app_state = init_test(cx);
++
++        let restored_dir = path!("/dir_opened_in_first_session");
++        app_state
++            .fs
++            .as_fake()
++            .insert_tree(restored_dir, json!({}))
++            .await;
++
++        // 最初のセッションでワークスペースを開き、レコードをデータベースへ保存する。
++        let workspace::OpenResult { window, .. } = cx
++            .update(|cx| {
++                Workspace::new_local(
++                    vec![restored_dir.into()],
++                    app_state.clone(),
++                    None,
++                    None,
++                    None,
++                    OpenMode::Activate,
++                    cx,
++                )
++            })
++            .await
++            .expect("failed to open workspace");
++        cx.run_until_parked();
++        flush_workspace_serialization(&window, cx).await;
++
++        window
++            .update(cx, |_, window, _| window.remove_window())
++            .unwrap();
++        cx.run_until_parked();
++
++        // 二重起動したインスタンスが保存済みのセッション ID を置き換えた状態を再現する。
++        // 更新後の再起動ではこのせいで直近セッションのワークスペースが見つからない。
++        cx.update(|cx| {
++            app_state.session.update(cx, |app_session, _cx| {
++                app_session.replace_session_for_test(Session::test_with_old_session(
++                    "replaced-by-second-instance".to_string(),
++                ));
++            });
++        });
++
++        let mut async_cx = cx.to_async();
++        let locations = crate::restorable_workspace_locations(&mut async_cx, &app_state)
++            .await
++            .expect("an orphaned session id must fall back to the last opened workspace");
++        assert_eq!(
++            locations.len(),
++            1,
++            "expected the last opened workspace to be restored, got {locations:?}"
++        );
++        assert!(
++            locations[0]
++                .paths
++                .paths()
++                .iter()
++                .any(|path| path.as_path() == Path::new(restored_dir)),
++            "expected {restored_dir} to be restored, got {:?}",
++            locations[0].paths.paths()
++        );
++    }
++
++    #[gpui::test]
++    async fn test_restore_on_startup_disabled_does_not_fall_back_to_last_workspace(
++        cx: &mut TestAppContext,
++    ) {
++        use session::Session;
++        use workspace::{self, OpenMode, Workspace};
++
++        let app_state = init_test(cx);
++
++        // 復元を無効にしている利用者が、退避のせいで勝手にプロジェクトを開かないことを確認する。
++        cx.update(|cx| {
++            SettingsStore::update_global(cx, |store, cx| {
++                store.update_user_settings(cx, |settings| {
++                    settings.workspace.restore_on_startup =
++                        Some(workspace::RestoreOnStartupBehavior::EmptyTab);
++                });
++            });
++        });
++
++        let kept_dir = path!("/dir_with_restoration_disabled");
++        app_state
++            .fs
++            .as_fake()
++            .insert_tree(kept_dir, json!({}))
++            .await;
++
++        let workspace::OpenResult { window, .. } = cx
++            .update(|cx| {
++                Workspace::new_local(
++                    vec![kept_dir.into()],
++                    app_state.clone(),
++                    None,
++                    None,
++                    None,
++                    OpenMode::Activate,
++                    cx,
++                )
++            })
++            .await
++            .expect("failed to open workspace");
++        cx.run_until_parked();
++        flush_workspace_serialization(&window, cx).await;
++
++        window
++            .update(cx, |_, window, _| window.remove_window())
++            .unwrap();
++        cx.run_until_parked();
++
++        cx.update(|cx| {
++            app_state.session.update(cx, |app_session, _cx| {
++                app_session.replace_session_for_test(Session::test_with_old_session(
++                    "replaced-by-second-instance".to_string(),
++                ));
++            });
++        });
++
++        let mut async_cx = cx.to_async();
++        let locations = crate::restorable_workspace_locations(&mut async_cx, &app_state).await;
++        assert!(
++            locations.is_none(),
++            "disabling restoration must not fall back to the last workspace, got {locations:?}"
++        );
++    }
++
+     #[gpui::test]
+     async fn test_reload_restores_project_windows_and_tabs(cx: &mut TestAppContext) {
+         use session::Session;
+diff --git a/docs/src/reference/all-settings.md b/docs/src/reference/all-settings.md
+index 7ad4f8c..3e9af19 100644
+--- a/docs/src/reference/all-settings.md
++++ b/docs/src/reference/all-settings.md
+@@ -4100,6 +4100,8 @@ List of strings containing any combination of:
+ }
+ ```
+ 
++When the workspaces saved for the last session cannot be found, for example because another Zed instance replaced the saved session id while this one was launching, Zed falls back to restoring the last opened workspace instead of opening an empty window.
++
+ 2. Restore the workspace that was closed last:
+ 
+ ```json [settings]

@@ -1,0 +1,648 @@
+diff --git a/crates/fs/src/fs.rs b/crates/fs/src/fs.rs
+index 893c25f..69ca5c8 100644
+--- a/crates/fs/src/fs.rs
++++ b/crates/fs/src/fs.rs
+@@ -100,6 +100,32 @@ impl From<PathEvent> for PathBuf {
+     }
+ }
+ 
++/// ファイル監視にポーリングを使うかどうかの強制指定。
++///
++/// `file_watcher_use_polling` 設定から変換される。`Auto` は環境変数
++/// `ZED_FILE_WATCHER_MODE` とファイルシステム種の自動判定に委ねることを意味する。
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub enum FileWatchMode {
++    /// 設定による指定はない。環境変数と自動判定にフォールバックする。
++    #[default]
++    Auto,
++    /// 常にポーリングで監視する。
++    Poll,
++    /// 常に OS 標準のファイルウォッチャーで監視する。
++    Native,
++}
++
++impl FileWatchMode {
++    /// 設定ファイルの `file_watcher_use_polling` の値を監視方式に変換する。
++    pub fn from_use_polling(use_polling: Option<bool>) -> Self {
++        match use_polling {
++            Some(true) => Self::Poll,
++            Some(false) => Self::Native,
++            None => Self::Auto,
++        }
++    }
++}
++
+ #[async_trait::async_trait]
+ pub trait Fs: Send + Sync {
+     async fn create_dir(&self, path: &Path) -> Result<()>;
+@@ -172,6 +198,14 @@ pub trait Fs: Send + Sync {
+     /// deliver events (network mounts, some FUSE and WSL mounts), so it must be polled.
+     fn requires_poll_watcher(&self, path: &Path) -> bool;
+ 
++    /// 設定ファイルで指定された監視方式を受け取る。
++    /// 監視する場所を持たない実装では何もしない。
++    fn set_file_watch_mode(&self, _mode: FileWatchMode) {}
++
++    /// `file_watcher_poll_ms` 設定でポーリング間隔を指定する。`None` は既定値に戻す。
++    /// 監視する場所を持たない実装では何もしない。
++    fn set_file_watch_poll_ms(&self, _poll_ms: Option<u64>) {}
++
+     async fn watch(
+         &self,
+         path: &Path,
+@@ -463,6 +497,7 @@ pub struct RealFs {
+     job_event_subscribers: Arc<Mutex<Vec<JobEventSender>>>,
+     trash: Arc<Mutex<SlotMap<TrashId, TrashedEntry>>>,
+     is_case_sensitive: AtomicU8,
++    file_watch_mode: Mutex<FileWatchMode>,
+ }
+ 
+ pub trait FileHandle: Send + Sync + std::fmt::Debug {
+@@ -581,6 +616,7 @@ impl RealFs {
+             job_event_subscribers: Arc::new(Mutex::new(Vec::new())),
+             trash: Arc::new(Mutex::new(SlotMap::with_key())),
+             is_case_sensitive: Default::default(),
++            file_watch_mode: Mutex::new(FileWatchMode::default()),
+         })
+     }
+ 
+@@ -1202,7 +1238,20 @@ impl Fs for RealFs {
+     }
+ 
+     fn requires_poll_watcher(&self, path: &Path) -> bool {
+-        fs_watcher::requires_poll_watcher(path)
++        // 設定ファイルの値は環境変数より優先される。未設定の時だけ自動判定に委ねる。
++        match *self.file_watch_mode.lock() {
++            FileWatchMode::Poll => true,
++            FileWatchMode::Native => false,
++            FileWatchMode::Auto => fs_watcher::requires_poll_watcher(path),
++        }
++    }
++
++    fn set_file_watch_mode(&self, mode: FileWatchMode) {
++        *self.file_watch_mode.lock() = mode;
++    }
++
++    fn set_file_watch_poll_ms(&self, poll_ms: Option<u64>) {
++        self.poll_watcher.set_poll_interval(poll_ms);
+     }
+ 
+     async fn watch(
+diff --git a/crates/fs/src/fs_watcher.rs b/crates/fs/src/fs_watcher.rs
+index 4d0d185..265dee4 100644
+--- a/crates/fs/src/fs_watcher.rs
++++ b/crates/fs/src/fs_watcher.rs
+@@ -7,7 +7,10 @@ use std::{
+     ops::DerefMut,
+     path::Path,
+     pin::Pin,
+-    sync::{Arc, LazyLock},
++    sync::{
++        Arc, LazyLock,
++        atomic::{AtomicU64, Ordering},
++    },
+     time::{Duration, Instant},
+ };
+ use util::{ResultExt, paths::SanitizedPath};
+@@ -284,11 +287,17 @@ fn path_covered_by_recursive_registration(
+ ///
+ /// Returns `true` for filesystem types where inotify/FSEvents/ReadDirectoryChanges
+ /// silently fail to deliver events: 9P (WSL drvfs), NFS, CIFS/SMB, FUSE (sshfs), etc.
++/// Detection runs on Linux (statfs magic), macOS (statfs `f_fstypename`) and Windows
++/// (`GetDriveTypeW` reporting a remote volume); other platforms keep native watching.
+ ///
+ /// Can be overridden with the `ZED_FILE_WATCHER_MODE` environment variable:
+ /// - `native` — always use native OS watcher
+ /// - `poll` — always use polling
+ /// - `auto` (default) — auto-detect based on filesystem type
++///
++/// Settings given through `file_watcher_use_polling` take precedence over this
++/// variable, so `RealFs` holds them as a `FileWatchMode` and only calls this
++/// function when the setting is unset.
+ pub fn requires_poll_watcher(path: &Path) -> bool {
+     match std::env::var("ZED_FILE_WATCHER_MODE")
+         .as_deref()
+@@ -304,13 +313,103 @@ pub fn requires_poll_watcher(path: &Path) -> bool {
+         return detect_requires_poll_watcher_linux(path);
+     }
+ 
+-    #[cfg(not(target_os = "linux"))]
++    #[cfg(target_os = "macos")]
++    {
++        return detect_requires_poll_watcher_macos(path);
++    }
++
++    #[cfg(target_os = "windows")]
++    {
++        return detect_requires_poll_watcher_windows(path);
++    }
++
++    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+     {
+         let _ = path;
+         false
+     }
+ }
+ 
++/// `GetDriveTypeW` that returns this value is reporting a mapped network drive or a
++/// UNC share, where ReadDirectoryChangesW does not reliably deliver events.
++#[cfg(target_os = "windows")]
++const WINDOWS_DRIVE_REMOTE: u32 = 4;
++
++/// Whether a mounted volume's filesystem name belongs to a network or FUSE share,
++/// where FSEvents silently fails to deliver events. macOS reports FUSE mounts as
++/// `fuse_<name>`, so those are matched by prefix.
++#[cfg(target_os = "macos")]
++fn file_system_name_requires_polling(name: &str) -> bool {
++    let name = name.to_ascii_lowercase();
++    name.starts_with("fuse")
++        || ["afpfs", "cifs", "nfs", "smb", "smbfs", "webdav"]
++            .iter()
++            .any(|network_name| name == *network_name)
++}
++
++#[cfg(target_os = "macos")]
++fn detect_requires_poll_watcher_macos(path: &Path) -> bool {
++    use std::ffi::CString;
++    use std::os::unix::ffi::OsStrExt;
++
++    let Ok(c_path) = CString::new(path.as_os_str().as_bytes()) else {
++        return false;
++    };
++    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
++    // statfs is called on paths Zed already resolved, so a failure just means we
++    // cannot classify the volume and keep the existing native behavior.
++    if unsafe { libc::statfs(c_path.as_ptr(), &mut stat) } != 0 {
++        return false;
++    }
++
++    let file_system_name = nul_terminated_bytes_to_string(&stat.f_fstypename);
++    if file_system_name_requires_polling(&file_system_name) {
++        log::info!(
++            "Detected network filesystem \"{}\" at {}, using poll watcher",
++            file_system_name,
++            path.display()
++        );
++        return true;
++    }
++
++    false
++}
++
++#[cfg(target_os = "windows")]
++fn detect_requires_poll_watcher_windows(path: &Path) -> bool {
++    use windows::Win32::Storage::FileSystem::{GetDriveTypeW, GetVolumePathNameW};
++    use windows::core::{HSTRING, PCWSTR};
++
++    let path_hstring = HSTRING::from(path.as_os_str());
++    // GetVolumePathNameW は終端の NUL を書くので、このバッファはそのまま PCWSTR として渡せる。
++    let mut volume_buf = vec![0u16; path.as_os_str().len() + 2];
++    if unsafe { GetVolumePathNameW(&path_hstring, &mut volume_buf) }.is_err() {
++        return false;
++    }
++
++    let drive_type = unsafe { GetDriveTypeW(PCWSTR::from_raw(volume_buf.as_ptr())) };
++    if drive_type == WINDOWS_DRIVE_REMOTE {
++        log::info!(
++            "Detected network volume (drive type {drive_type}) for {}, using poll watcher",
++            path.display()
++        );
++        return true;
++    }
++
++    false
++}
++
++/// C 固定長配列の NUL 打ち切り済みバイト列を String に変換する（ファイルシステム名の比較用）。
++#[cfg(target_os = "macos")]
++fn nul_terminated_bytes_to_string(values: &[std::ffi::c_char]) -> String {
++    let bytes: Vec<u8> = values
++        .iter()
++        .take_while(|value| **value != 0)
++        .map(|value| *value as u8)
++        .collect();
++    String::from_utf8_lossy(&bytes).into_owned()
++}
++
+ fn register_existing_path(
+     native_watcher: &Arc<OsWatcher>,
+     poll_watcher: &Arc<OsWatcher>,
+@@ -323,7 +422,7 @@ fn register_existing_path(
+     let os_watcher = if fs.requires_poll_watcher(path.as_ref()) {
+         log::info!(
+             "Using poll watcher ({}ms interval) for {}",
+-            poll_interval().as_millis(),
++            poll_watcher.poll_interval().as_millis(),
+             path.display()
+         );
+         telemetry::event!("fs_watcher_poll", path = path.display().to_string());
+@@ -591,7 +690,7 @@ async fn poll_path_until_created(
+     pending_registrations: Arc<Mutex<HashMap<Arc<Path>, Task<()>>>>,
+ ) {
+     loop {
+-        executor.timer(poll_interval()).await;
++        executor.timer(poll_watcher.poll_interval()).await;
+ 
+         if !pending_registrations.lock().contains_key(path.as_ref()) {
+             return;
+@@ -920,6 +1019,9 @@ impl<T: notify::Watcher + Send> WatchBackend for T {
+ pub struct OsWatcher {
+     kind: OsWatcherKind,
+     recursive: bool,
++    // notify の PollWatcher は間隔をバックエンド生成時にしか読まないため、生成後の変更は
++    // Zed の再起動（バックエンド作り直し）まで反映されない。
++    poll_interval_ms: Arc<AtomicU64>,
+     state: Arc<Mutex<WatcherState>>,
+ 
+     // Hold state across backend mutations. Callbacks don't acquire state or
+@@ -963,6 +1065,7 @@ impl OsWatcher {
+         Arc::new(Self {
+             kind,
+             recursive: kind.is_recursive(),
++            poll_interval_ms: Arc::new(AtomicU64::new(*DEFAULT_POLL_INTERVAL_MILLISECONDS)),
+             state,
+             backend: Mutex::new(backend),
+             event_tx,
+@@ -971,6 +1074,20 @@ impl OsWatcher {
+         })
+     }
+ 
++    /// 現在のポーリング間隔。ネイティブ監視のバックエンドでは使わない。
++    pub fn poll_interval(&self) -> Duration {
++        Duration::from_millis(self.poll_interval_ms.load(Ordering::Relaxed))
++    }
++
++    /// `file_watcher_poll_ms` 設定でポーリング間隔を上書きする。`None` は既定値に戻す。
++    pub fn set_poll_interval(&self, poll_ms: Option<u64>) {
++        let milliseconds = match poll_ms {
++            Some(poll_ms) => clamp_poll_interval_milliseconds(poll_ms),
++            None => *DEFAULT_POLL_INTERVAL_MILLISECONDS,
++        };
++        self.poll_interval_ms.store(milliseconds, Ordering::Relaxed);
++    }
++
+     /// The callback a substitute backend uses to report events, standing
+     /// in for the `EventHandler` notify would have been constructed with.
+     pub(crate) fn event_sink(
+@@ -1208,7 +1325,7 @@ impl OsWatcher {
+                     )
+                 }
+                 OsWatcherKind::Poll => {
+-                    let config = notify::Config::default().with_poll_interval(*POLL_INTERVAL);
++                    let config = notify::Config::default().with_poll_interval(self.poll_interval());
+                     Box::new(
+                         notify::PollWatcher::new(self.event_sink(), config)
+                             .inspect_err(|error| self.record_backend_error(error))?,
+@@ -1374,15 +1491,29 @@ fn is_max_files_watch_error(error: &anyhow::Error) -> bool {
+         .is_some_and(|error| matches!(&error.kind, notify::ErrorKind::MaxFilesWatch))
+ }
+ 
+-static POLL_INTERVAL: LazyLock<Duration> = LazyLock::new(|| {
+-    let poll_ms: u64 = std::env::var("ZED_FILE_WATCHER_POLL_MS")
+-        .ok()
+-        .and_then(|value| value.parse().ok())
+-        .unwrap_or(2000)
+-        .clamp(500, 30000);
+-    Duration::from_millis(poll_ms)
++/// 設定も環境変もないときの既定間隔（ミリ秒）。
++const FALLBACK_POLL_INTERVAL_MILLISECONDS: u64 = 2000;
++
++/// 取りこぼしと CPU 過剰消費を防ぐため、受け付けるポーリング間隔に下限と上限を設ける。
++fn clamp_poll_interval_milliseconds(milliseconds: u64) -> u64 {
++    milliseconds.clamp(500, 30_000)
++}
++
++/// `file_watcher_poll_ms` 設定がない場合に使う既定の間隔。`ZED_FILE_WATCHER_POLL_MS` 環境変数でも決まる。
++static DEFAULT_POLL_INTERVAL_MILLISECONDS: LazyLock<u64> = LazyLock::new(|| {
++    clamp_poll_interval_milliseconds(
++        std::env::var("ZED_FILE_WATCHER_POLL_MS")
++            .ok()
++            .and_then(|value| value.parse().ok())
++            .unwrap_or(FALLBACK_POLL_INTERVAL_MILLISECONDS),
++    )
+ });
+ 
++/// 設定由来の上書きがないときのポーリング間隔。
++pub fn default_poll_interval() -> Duration {
++    Duration::from_millis(*DEFAULT_POLL_INTERVAL_MILLISECONDS)
++}
++
+ static NATIVE_WATCH_LIMIT_COOLDOWN: LazyLock<Duration> = LazyLock::new(|| {
+     let cooldown_seconds: u64 = std::env::var("ZED_NATIVE_WATCH_LIMIT_COOLDOWN_SECONDS")
+         .ok()
+@@ -1392,10 +1523,6 @@ static NATIVE_WATCH_LIMIT_COOLDOWN: LazyLock<Duration> = LazyLock::new(|| {
+     Duration::from_secs(cooldown_seconds)
+ });
+ 
+-pub fn poll_interval() -> Duration {
+-    *POLL_INTERVAL
+-}
+-
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -1415,6 +1542,62 @@ mod tests {
+         }
+     }
+ 
++    /// ネットワーク共有と FUSE だけをポーリング対象とし、ローカルボリュームはネイティブのままにする。
++    #[cfg(target_os = "macos")]
++    #[test]
++    fn test_network_file_system_names_require_polling() {
++        for name in [
++            "smbfs",
++            "SMBFS",
++            "nfs",
++            "afpfs",
++            "cifs",
++            "webdav",
++            "fuse_t",
++            "fuse_xfuse",
++        ] {
++            assert!(
++                file_system_name_requires_polling(name),
++                "{name} はネットワーク共有として扱う"
++            );
++        }
++        for name in ["apfs", "hfs", "exfat", "msdos", "ntfs", "tmpfs"] {
++            assert!(
++                !file_system_name_requires_polling(name),
++                "{name} はネイティブ監視を維持する"
++            );
++        }
++    }
++
++    /// macOS のローカルな一時ディレクトリでは自動検出がポーリングを選ばないことを確認する。
++    #[cfg(target_os = "macos")]
++    #[test]
++    fn test_local_macos_volume_does_not_require_poll_watcher() {
++        let temp_dir = tempfile::TempDir::new().expect("create temp dir");
++        assert!(!detect_requires_poll_watcher_macos(temp_dir.path()));
++    }
++
++    /// 設定での上書きが既定値（環境変数込み）に対する優先度を持つことを確認する。
++    #[test]
++    fn test_poll_watcher_interval_override() {
++        let watcher = test_os_watcher(OsWatcherKind::Poll, None);
++
++        assert_eq!(watcher.poll_interval(), default_poll_interval());
++
++        watcher.set_poll_interval(Some(50));
++        assert_eq!(watcher.poll_interval(), Duration::from_millis(500));
++
++        watcher.set_poll_interval(Some(60_000));
++        assert_eq!(watcher.poll_interval(), Duration::from_millis(30_000));
++
++        watcher.set_poll_interval(Some(750));
++        assert_eq!(watcher.poll_interval(), Duration::from_millis(750));
++
++        // 未設定に戻すと環境変数込みの既定値へ戻る。
++        watcher.set_poll_interval(None);
++        assert_eq!(watcher.poll_interval(), default_poll_interval());
++    }
++
+     #[derive(Default)]
+     struct FakeWatchBackend {
+         watched_paths: HashSet<PathBuf>,
+@@ -1460,6 +1643,7 @@ mod tests {
+         OsWatcher {
+             kind,
+             recursive: kind.is_recursive(),
++            poll_interval_ms: Arc::new(AtomicU64::new(*DEFAULT_POLL_INTERVAL_MILLISECONDS)),
+             state: Arc::new(Mutex::new(WatcherState {
+                 watchers: Default::default(),
+                 paths: Default::default(),
+@@ -1542,7 +1726,7 @@ mod tests {
+         // the deterministic executor cannot drive; park until the poll task
+         // signals the event channel.
+         cx.executor().allow_parking();
+-        cx.executor().advance_clock(poll_interval());
++        cx.executor().advance_clock(default_poll_interval());
+         rx.recv().await.expect("receive watcher event");
+ 
+         assert!(
+diff --git a/crates/fs/tests/integration/fs_tests.rs b/crates/fs/tests/integration/fs_tests.rs
+index 8a7ab4f..7f38d25 100644
+--- a/crates/fs/tests/integration/fs_tests.rs
++++ b/crates/fs/tests/integration/fs_tests.rs
+@@ -522,6 +522,38 @@ async fn test_realfs_canonicalize(executor: BackgroundExecutor) {
+     assert!(canonicalized.is_ok());
+ }
+ 
++/// `file_watcher_use_polling` 設定が環境変数より優先されることを確認する。
++#[gpui::test]
++async fn test_realfs_file_watch_mode_override(executor: BackgroundExecutor) {
++    let fs = RealFs::new(None, executor);
++    let temp_dir = TempDir::new().unwrap();
++    let path = temp_dir.path();
++
++    // 設定ファイルの true / false / 未設定がどの監視方式に対応するか。
++    assert_eq!(
++        FileWatchMode::from_use_polling(Some(true)),
++        FileWatchMode::Poll
++    );
++    assert_eq!(
++        FileWatchMode::from_use_polling(Some(false)),
++        FileWatchMode::Native
++    );
++    assert_eq!(FileWatchMode::from_use_polling(None), FileWatchMode::Auto);
++
++    fs.set_file_watch_mode(FileWatchMode::Poll);
++    assert!(fs.requires_poll_watcher(path));
++
++    fs.set_file_watch_mode(FileWatchMode::Native);
++    assert!(!fs.requires_poll_watcher(path));
++
++    // 未設定に戻した時は自動判定と同じ結果になる。
++    fs.set_file_watch_mode(FileWatchMode::Auto);
++    assert_eq!(
++        fs.requires_poll_watcher(path),
++        fs_watcher::requires_poll_watcher(path)
++    );
++}
++
+ #[gpui::test]
+ async fn test_rename(executor: BackgroundExecutor) {
+     let fs = FakeFs::new(executor.clone());
+diff --git a/crates/settings/src/vscode_import.rs b/crates/settings/src/vscode_import.rs
+index 8f6e81e..780a1c2 100644
+--- a/crates/settings/src/vscode_import.rs
++++ b/crates/settings/src/vscode_import.rs
+@@ -201,6 +201,8 @@ impl VsCodeSettings {
+             extension: ExtensionSettingsContent::default(),
+             call_hierarchy: None,
+             file_finder: None,
++            file_watcher_poll_ms: None,
++            file_watcher_use_polling: None,
+             git: self.git_settings_content(),
+             git_panel: self.git_panel_settings_content(),
+             global_lsp_settings: skip_default(GlobalLspSettingsContent {
+diff --git a/crates/settings_content/src/settings_content.rs b/crates/settings_content/src/settings_content.rs
+index 88083da..1c72d1a 100644
+--- a/crates/settings_content/src/settings_content.rs
++++ b/crates/settings_content/src/settings_content.rs
+@@ -196,6 +196,24 @@ pub struct SettingsContent {
+     /// Settings related to the file finder.
+     pub file_finder: Option<FileFinderSettingsContent>,
+ 
++    /// Chooses how Zed detects file changes:
++    /// - `true`: always poll for file changes
++    /// - `false`: always use the operating system's file watcher
++    /// - unset: follow the filesystem-type auto-detection, which `ZED_FILE_WATCHER_MODE` can also override
++    ///
++    /// Settings files take precedence over that environment variable, so leaving this setting unset keeps the existing behavior.
++    /// How often polling runs is controlled by `file_watcher_poll_ms`.
++    ///
++    /// Default: unset
++    pub file_watcher_use_polling: Option<bool>,
++
++    /// How often polling checks for file changes, in milliseconds. Values outside the range 500 to 30000 are clamped.
++    /// This setting takes precedence over the `ZED_FILE_WATCHER_POLL_MS` environment variable.
++    /// The interval is read when the polling watcher starts, so restart Zed after changing it.
++    ///
++    /// Default: 2000
++    pub file_watcher_poll_ms: Option<u64>,
++
+     pub call_hierarchy: Option<CallHierarchySettingsContent>,
+ 
+     pub git_panel: Option<GitPanelSettingsContent>,
+@@ -404,7 +422,8 @@ impl SettingsContent {
+ fallible_options::flattened_deserialize!(SettingsContent {
+     sections: { project, theme, extension, workspace, editor, remote },
+     options: {
+-        call_hierarchy, command_palette, file_finder, git_panel, tabs, tab_bar, status_bar, preview_tabs, agent,
++        call_hierarchy, command_palette, file_finder, file_watcher_poll_ms, file_watcher_use_polling,
++        git_panel, tabs, tab_bar, status_bar, preview_tabs, agent,
+         agent_servers, audio, auto_update, base_keymap, collaboration_panel, debugger, diagnostics,
+         git,
+         global_lsp_settings, image_viewer, markdown_preview, repl, helix_mode, hide_mouse,
+diff --git a/crates/settings_ui/src/page_data.rs b/crates/settings_ui/src/page_data.rs
+index 24b82e5..a6d4c26 100644
+--- a/crates/settings_ui/src/page_data.rs
++++ b/crates/settings_ui/src/page_data.rs
+@@ -4145,6 +4145,41 @@ fn search_and_files_page() -> SettingsPage {
+         ]
+     }
+ 
++    // ファイルスキャンとファイル監視は別の動作なので、監視専用のセクションにする。
++    fn file_watching_section() -> [SettingsPageItem; 3] {
++        [
++            SettingsPageItem::SectionHeader("File Watching"),
++            SettingsPageItem::SettingItem(SettingItem {
++                title: "Use Polling For File Watching",
++                description: "Whether to poll for file changes instead of using the operating system's file watcher. When unset, Zed chooses based on the filesystem, which `ZED_FILE_WATCHER_MODE` can also override. This setting takes precedence over that variable. Changes apply to projects opened after it is set.",
++                field: Box::new(SettingField {
++                    organization_override: None,
++                    json_path: Some("file_watcher_use_polling"),
++                    pick: |settings_content| settings_content.file_watcher_use_polling.as_ref(),
++                    write: |settings_content, value, _| {
++                        settings_content.file_watcher_use_polling = value;
++                    },
++                }),
++                metadata: None,
++                files: USER,
++            }),
++            SettingsPageItem::SettingItem(SettingItem {
++                title: "Poll Interval",
++                description: "How often polling checks for file changes, in milliseconds. Values outside 500 to 30000 are clamped, and this setting takes precedence over `ZED_FILE_WATCHER_POLL_MS`. The interval is read when the polling watcher starts, so restart Zed after changing it.",
++                field: Box::new(SettingField {
++                    organization_override: None,
++                    json_path: Some("file_watcher_poll_ms"),
++                    pick: |settings_content| settings_content.file_watcher_poll_ms.as_ref(),
++                    write: |settings_content, value, _| {
++                        settings_content.file_watcher_poll_ms = value;
++                    },
++                }),
++                metadata: None,
++                files: USER,
++            }),
++        ]
++    }
++
+     SettingsPage {
+         title: "Search & Files",
+         items: concat_sections![
+@@ -4152,6 +4187,7 @@ fn search_and_files_page() -> SettingsPage {
+             command_palette_section(),
+             file_finder_section(),
+             file_scan_section(),
++            file_watching_section(),
+         ],
+     }
+ }
+diff --git a/crates/zed/src/zed.rs b/crates/zed/src/zed.rs
+index a5d947b..d5ae000 100644
+--- a/crates/zed/src/zed.rs
++++ b/crates/zed/src/zed.rs
+@@ -438,6 +438,8 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
+     init_cursor_hide_mode(cx);
+     init_app_appearance(cx);
+     init_reduce_motion(cx);
++    // worktree が watcher を登録する前に監視方式と間隔を決めておく必要がある。
++    init_file_watcher_settings(app_state.fs.clone(), cx);
+     init_global_config_error_notifications(cx);
+ 
+     cx.observe_new(|_multi_workspace: &mut MultiWorkspace, window, cx| {
+@@ -2081,6 +2083,23 @@ fn init_reduce_motion(cx: &mut App) {
+     cx.observe_global::<SettingsStore>(apply).detach();
+ }
+ 
++/// `file_watcher_use_polling` と `file_watcher_poll_ms` 設定を `fs` に反映する。
++///
++/// 監視方式はウォッチ登録時に、ポーリング間隔はポーリング用バックエンドの生成時に決まるため、
++/// 稼働中の変更が効くのはプロジェクトを開き直した時、または Zed の再起動時になる。
++fn init_file_watcher_settings(fs: Arc<dyn fs::Fs>, cx: &mut App) {
++    let apply = move |cx: &mut App| {
++        let settings = SettingsStore::global(cx).merged_settings();
++        // 未設定の時だけ `fs` 側が環境変数と自動判定にフォールバックする。
++        fs.set_file_watch_mode(fs::FileWatchMode::from_use_polling(
++            settings.file_watcher_use_polling,
++        ));
++        fs.set_file_watch_poll_ms(settings.file_watcher_poll_ms);
++    };
++    apply(cx);
++    cx.observe_global::<SettingsStore>(apply).detach();
++}
++
+ /// Starts watching `~/.config/zed/AGENTS.md` (or the platform equivalent) and
+ /// surfaces any read errors using the same notification UI as settings errors.
+ ///
+diff --git a/docs/src/reference/all-settings.md b/docs/src/reference/all-settings.md
+index 4d95a74..7ad4f8c 100644
+--- a/docs/src/reference/all-settings.md
++++ b/docs/src/reference/all-settings.md
+@@ -2493,6 +2493,34 @@ In multi-folder projects, depth is measured from each root folder separately.
+ 
+ When set to `expanded`, symbolic links are only scanned after you explicitly expand them in the project panel. When set to `always`, Zed follows all symbolic links and scans their contents when indexing the project, unless they match gitignore rules. The `always` option may have performance implications for projects with many or deeply nested symlinks.
+ 
++## File Watcher Polling
++
++- Setting: `file_watcher_use_polling`
++- Description: Whether Zed polls for file changes instead of using the operating system's file watcher. This setting takes precedence over the `ZED_FILE_WATCHER_MODE` environment variable.
++- Default: unset, which lets Zed choose based on the filesystem type
++
++```json [settings]
++{
++  "file_watcher_use_polling": true
++}
++```
++
++Use `false` to always use the native OS watcher, or remove the key to go back to automatic detection. Automatic detection inspects the volume a path sits on: network shares (SMB, NFS, CIFS, AFP, WebDAV), FUSE mounts and 9P/WSL drvfs mounts are polled, while local disks keep native watching. Watchers are registered when a project is opened, so a change applies to projects you open after saving this setting.
++
++## File Watcher Poll Interval
++
++- Setting: `file_watcher_poll_ms`
++- Description: How often polling checks for file changes, in milliseconds. Values outside the range 500 to 30000 are clamped. This setting takes precedence over the `ZED_FILE_WATCHER_POLL_MS` environment variable.
++- Default: 2000
++
++```json [settings]
++{
++  "file_watcher_poll_ms": 500
++}
++```
++
++Shorter intervals notice changes sooner but re-scan watched directories more often, so large projects cost more CPU and disk I/O. The interval is read when the polling watcher starts, so restart Zed after changing it.
++
+ ## File Types
+ 
+ - Setting: `file_types`

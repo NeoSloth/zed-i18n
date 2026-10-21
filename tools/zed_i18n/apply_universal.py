@@ -1459,6 +1459,25 @@ const SETTINGS_DISCLAIMER: &str = "Note: custom tool permissions only apply to t
         "                        conflict_message,",
     )
     patch(
+        "crates/workspace/src/pane.rs",
+        '''        const DISCONNECTED_SHARE_MESSAGE: &str =
+            "The network share holding this file is disconnected. Do you want to try saving it anyway?";
+        const DISCONNECTED_SHARE_DETAIL: &str =
+            "Zed will read the file again when the share is connected.";''',
+        '''        let disconnected_share_message = localization::localized_str!("The network share holding this file is disconnected. Do you want to try saving it anyway?");
+        let disconnected_share_detail = localization::localized_str!("Zed will read the file again when the share is connected.");''',
+    )
+    patch(
+        "crates/workspace/src/pane.rs",
+        "                    DISCONNECTED_SHARE_MESSAGE,",
+        "                    disconnected_share_message,",
+    )
+    patch(
+        "crates/workspace/src/pane.rs",
+        "                    Some(DISCONNECTED_SHARE_DETAIL),",
+        "                    Some(disconnected_share_detail),",
+    )
+    patch(
         "crates/workspace/src/welcome.rs",
         "                self.title,",
         "                localization::translate_static(self.title),",
@@ -1577,8 +1596,10 @@ _EXPECTED_MANUAL_SITES: frozenset[tuple[str, str]] = frozenset({
     ("crates/settings_ui/src/pages/tool_permissions_setup.rs", "Web search queries"),
     ("crates/settings_ui/src/pages/tool_permissions_setup.rs", "Write File"),
     ("crates/settings_ui/src/pages/tool_permissions_setup.rs", "`rm -rf` commands are always blocked when run on `$HOME`, `~`, `.`, `..`, or `/`"),
+    ("crates/workspace/src/pane.rs", "The network share holding this file is disconnected. Do you want to try saving it anyway?"),
     ("crates/workspace/src/pane.rs", "This file has been deleted on disk since you started editing it. Do you want to recreate it?"),
     ("crates/workspace/src/pane.rs", "This file has changed on disk since you started editing it. Do you want to overwrite it?"),
+    ("crates/workspace/src/pane.rs", "Zed will read the file again when the share is connected."),
     ("crates/workspace/src/welcome.rs", "Clone Repository"),
     ("crates/workspace/src/welcome.rs", "Configure"),
     ("crates/workspace/src/welcome.rs", "Customize Keymaps"),

@@ -123,6 +123,18 @@ When updating the version, `generate-version-diff` writes the key changes agains
 
 Newly discovered strings are added to `manifest/ui-strings.json` with the `needs_review` status. Mark only strings that are actually shown in the UI as `accepted`, then translate them.
 
+## Following A New Zed Release
+
+When the Zed source is your own fork, follow the releases in this order.
+
+1. Merge this repository's own upstream first. Upstream also follows each Zed release shortly, and doing it afterwards duplicates the translation and `docs/readme` work and conflicts on `catalog/` and `manifest/`. When a conflict reaches `manifest/ui-strings.json` or `catalog/en-US.json`, take the upstream file and re-run `extract` against the source you pinned.
+2. In the Zed fork, bring the branch that carries your changes onto the new stable tag - either `git merge v1.24.4`, or `git rebase --onto v1.24.4 v1.24.3 <branch>` while the change list is still short - and tag the result, for example `v1.24.4-l10n.1`.
+3. Set `zed_version` to the upstream release, `zed_ref` to the tag that was just created, and `zed_commit` to its commit in `config/project.toml`.
+4. Run `fetch-zed`, then the version-update commands listed above.
+5. Run `extract` whenever the pin changes, even when the release added no UI strings. `manifest/ui-strings.json` stores byte offsets, so any shift in a source file makes the build stop with `occurrence byte span is stale`, while `validate` passes because it only checks keys and placeholders. Strings that were registered by hand are not reproduced by `extract`; re-add them with offsets verified against the new source.
+
+Each versioned checkout keeps its own build directory, and they are large. Either remove the version directories you no longer build from, or keep one shared build directory and link it into each checkout: Zed's own `script/bundle-mac` reads `target/` relative to the checkout, so pointing `CARGO_TARGET_DIR` outside the checkout builds and bundles but then fails at the debug symbols step.
+
 ## AI Translation
 
 For AI-driven translation runs, follow `prompts/commands/translation-start.md`. To compare and merge results from multiple models, use `prompts/commands/translation-review.md`.
