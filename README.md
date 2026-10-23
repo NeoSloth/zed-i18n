@@ -133,8 +133,6 @@ When the Zed source is your own fork, follow the releases in this order.
 4. Run `fetch-zed`, then the version-update commands listed above.
 5. Run `extract` whenever the pin changes, even when the release added no UI strings. `manifest/ui-strings.json` stores byte offsets, so any shift in a source file makes the build stop with `occurrence byte span is stale`, while `validate` passes because it only checks keys and placeholders. Strings that were registered by hand are not reproduced by `extract`; carry them over with `uv run zed-i18n readd-manual`, which reads the manifest from a git ref (default `HEAD`) and re-adds only the entries whose recorded byte spans still match the pinned source, reporting the ones that no longer do.
 
-This fork intentionally carries the official Zed identity in `config/distribution.toml` (`product_name = "Zed"`, bundle id `dev.zed.Zed`, auto-update off), so release builds and local builds install as the same application. When the merge in step 1 reaches a change to this file, keep this fork's values.
-
 Each versioned checkout keeps its own build directory, and they are large. Either remove the version directories you no longer build from, or keep one shared build directory and link it into each checkout: Zed's own `script/bundle-mac` reads `target/` relative to the checkout, so pointing `CARGO_TARGET_DIR` outside the checkout builds and bundles but then fails at the debug symbols step.
 
 ## AI Translation

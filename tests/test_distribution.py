@@ -263,11 +263,10 @@ fn app_menus() -> Vec<Menu> {
     def test_repository_config_matches_windows_runtime_mutex(self) -> None:
         config = load_distribution_config(Path.cwd() / "config" / "distribution.toml")
 
-        # このフォークの [windows] は本家 Zed stable の実際値をそのまま踏んでいる（例: mutex は
-        # "Zed-Stable-..." で、上流設定の {app_identifier}-Instance-Mutex 導出規約では作られない名前）。
-        # 上流のような導出一致性ではなく、本家準拠が保たれていることを守る。
-        self.assertEqual(config.windows_app_identifier, "Zed-Editor-Stable")
-        self.assertEqual(config.windows_mutex, "Zed-Stable-Instance-Mutex")
+        self.assertEqual(
+            config.windows_mutex,
+            f"{config.windows_app_identifier}-Instance-Mutex",
+        )
 
     def test_applies_minimal_identity_about_and_updater_patches(self) -> None:
         config = load_distribution_config(self.write_config(""))
