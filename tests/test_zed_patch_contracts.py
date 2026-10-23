@@ -113,15 +113,19 @@ class ZedPatchContractTests(unittest.TestCase):
             self.zed_root / "script/bundle-windows.ps1"
         ).read_text(encoding="utf-8")
 
+        # identity 関連の期待値は config/distribution.toml の値から導出する。
+        # このフォークは配布 identity を本家 Zed に合わせているため、上流既定値の直書き（dev.zed-i18n 等）とは一致しない。
         self.assertIn("i18n_build: Option<SharedString>", zed_rs)
-        self.assertIn('ReleaseChannel::Stable => "dev.zed-i18n.Zed"', release_channel)
-        self.assertIn('identifier = "dev.zed-i18n.Zed"', zed_cargo_toml)
-        self.assertIn("get_i18n_release_asset", auto_update)
+        self.assertIn(f'ReleaseChannel::Stable => "{config.macos_bundle_id}"', release_channel)
+        self.assertIn(f'identifier = "{config.macos_bundle_id}"', zed_cargo_toml)
+        # updater 系 patch は config の update.enabled が true のときだけ適用される（distribution.py の条件と同形）。
+        if config.update_enabled:
+            self.assertIn("get_i18n_release_asset", auto_update)
         self.assertIn(
-            '"Software\\\\Classes\\\\ZedI18nContextMenu"',
+            f'"Software\\\\Classes\\\\{config.windows_registry_value}ContextMenu"',
             explorer_command_injector,
         )
-        self.assertIn('HSTRING::from("Open with Zed i18n")', explorer_command_injector)
+        self.assertIn(f'HSTRING::from("Open with {config.product_name}")', explorer_command_injector)
         self.assertNotIn("remote_server", bundle_linux)
         self.assertNotIn("remote_server", bundle_macos)
         self.assertNotIn("BuildRemoteServer", bundle_windows)
