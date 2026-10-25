@@ -80,7 +80,9 @@ def generate_homebrew_cask(manifest: dict[str, Any]) -> str:
                 "  end",
             ]
         )
-    lines.extend(_homebrew_platform_lines(locale_specific=True))
+    lines.extend(
+        _homebrew_platform_lines(repository=manifest["repository"], locale_specific=True)
+    )
     return "\n".join(lines) + "\n"
 
 
@@ -94,7 +96,9 @@ def _generate_universal_homebrew_cask(manifest: dict[str, Any]) -> str:
         f'  version "{version}"',
         f"  sha256 {_homebrew_checksums(manifest, None)}",
     ]
-    lines.extend(_homebrew_platform_lines(locale_specific=False))
+    lines.extend(
+        _homebrew_platform_lines(repository=manifest["repository"], locale_specific=False)
+    )
     return "\n".join(lines) + "\n"
 
 
@@ -114,10 +118,12 @@ def _homebrew_checksums(manifest: dict[str, Any], locale: str | None) -> str:
     return ", ".join(checksums)
 
 
-def _homebrew_platform_lines(*, locale_specific: bool) -> list[str]:
+def _homebrew_platform_lines(*, repository: str, locale_specific: bool) -> list[str]:
     locale_segment = "-#{language}" if locale_specific else ""
+    # ダウンロード基盤は manifest の repository から導出する。
+    # リリースを実際に公開したリポジトリ（フォークなら own releases）を指すため。
     release_url = (
-        "https://github.com/LI-NA/zed-i18n/releases/download/"
+        f"https://github.com/{repository}/releases/download/"
         "v#{version.csv.first}-i18n.#{version.csv.second}"
     )
     return [
@@ -156,7 +162,7 @@ def _homebrew_platform_lines(*, locale_specific: bool) -> list[str]:
         "",
         '  name "Zed i18n"',
         '  desc "Localized build of the Zed editor"',
-        '  homepage "https://github.com/LI-NA/zed-i18n"',
+        f'  homepage "https://github.com/{repository}"',
         "end",
     ]
 
@@ -170,13 +176,15 @@ def _scoop_app_manifest(
     shortcut_name: str,
     update_message: str,
     autoupdate_locale: str | None,
+    repository: str,
     notes: list[str] | None = None,
 ) -> dict[str, Any]:
     locale_segment = f"-{autoupdate_locale}" if autoupdate_locale else ""
+    # homebrew と同じく、参照 URL は manifest の repository から導出する。
     app: dict[str, Any] = {
         "version": version,
         "description": description,
-        "homepage": "https://github.com/LI-NA/zed-i18n",
+        "homepage": f"https://github.com/{repository}",
         "license": "GPL-3.0",
         "architecture": {
             "64bit": {
@@ -193,20 +201,20 @@ def _scoop_app_manifest(
         "env_set": {"ZED_UPDATE_EXPLANATION": update_message},
         "post_install": POST_INSTALL_LINES,
         "checkver": {
-            "url": "https://github.com/LI-NA/zed-i18n/releases/latest",
+            "url": f"https://github.com/{repository}/releases/latest",
             "regex": r"/releases/tag/v([\d.]+-i18n\.\d+)",
         },
         "autoupdate": {
             "architecture": {
                 "64bit": {
-                    "url": f"https://github.com/LI-NA/zed-i18n/releases/download/v$version/Zed-i18n{locale_segment}-windows-x86_64.zip"
+                    "url": f"https://github.com/{repository}/releases/download/v$version/Zed-i18n{locale_segment}-windows-x86_64.zip"
                 },
                 "arm64": {
-                    "url": f"https://github.com/LI-NA/zed-i18n/releases/download/v$version/Zed-i18n{locale_segment}-windows-aarch64.zip"
+                    "url": f"https://github.com/{repository}/releases/download/v$version/Zed-i18n{locale_segment}-windows-aarch64.zip"
                 },
             },
             "hash": {
-                "url": "https://github.com/LI-NA/zed-i18n/releases/download/v$version/SHA256SUMS.txt"
+                "url": f"https://github.com/{repository}/releases/download/v$version/SHA256SUMS.txt"
             },
         },
     }
@@ -242,6 +250,7 @@ def generate_scoop_manifests(manifest: dict[str, Any]) -> dict[str, str]:
             shortcut_name=f"Zed i18n ({locale})",
             update_message=f"Run 'scoop update zed-i18n-{locale}' to update.",
             autoupdate_locale=locale,
+            repository=manifest["repository"],
         )
         output[f"zed-i18n-{locale}.json"] = json.dumps(app, indent=2, ensure_ascii=False) + "\n"
     return output
@@ -265,6 +274,7 @@ def _generate_universal_scoop_manifests(manifest: dict[str, Any]) -> dict[str, s
         shortcut_name="Zed i18n",
         update_message="Run 'scoop update zed-i18n' to update.",
         autoupdate_locale=None,
+        repository=manifest["repository"],
     )
     output["zed-i18n.json"] = json.dumps(universal, indent=2, ensure_ascii=False) + "\n"
 
@@ -277,6 +287,7 @@ def _generate_universal_scoop_manifests(manifest: dict[str, Any]) -> dict[str, s
             shortcut_name=f"Zed i18n ({locale})",
             update_message=f"Run 'scoop update zed-i18n-{locale}' to update.",
             autoupdate_locale=None,
+            repository=manifest["repository"],
             notes=[
                 "zed-i18n now ships a single build with every language included,",
                 "and this package installs that build. To switch to the plain",

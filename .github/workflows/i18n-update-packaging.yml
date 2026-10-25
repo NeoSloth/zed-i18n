@@ -18,8 +18,9 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  HOMEBREW_REPOSITORY: LI-NA/homebrew-zed-i18n
-  SCOOP_REPOSITORY: LI-NA/scoop-zed-i18n
+  # このフォークの配布チャネル（マスターのフォークした tap/bucket）。brew tap は neosloth/zed-i18n として追加する。
+  HOMEBREW_REPOSITORY: NeoSloth/homebrew-zed-i18n
+  SCOOP_REPOSITORY: NeoSloth/scoop-zed-i18n
   RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
 
 jobs:
@@ -170,11 +171,11 @@ jobs:
         run: |
           set -euo pipefail
           # Link the working tree so validation includes the generated, uncommitted cask.
-          tap_parent="$(brew --repository)/Library/Taps/li-na"
+          tap_parent="$(brew --repository)/Library/Taps/neosloth"
           mkdir -p "$tap_parent"
           ln -s "$GITHUB_WORKSPACE/packaging/homebrew" "$tap_parent/homebrew-zed-i18n"
-          brew trust li-na/zed-i18n
-          brew readall --os=all --arch=all li-na/zed-i18n
+          brew trust neosloth/zed-i18n
+          brew readall --os=all --arch=all neosloth/zed-i18n
           brew ruby -- tests/check_homebrew_cask.rb \
             "$tap_parent/homebrew-zed-i18n/Casks/zed-i18n.rb" release-assets/manifest.json
 

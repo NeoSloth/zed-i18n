@@ -440,17 +440,37 @@ class PackagingWorkflowTests(unittest.TestCase):
         self.assertIn("SHA256SUMS.txt", workflow)
         self.assertIn("uv run zed-i18n generate-packaging", workflow)
         self.assertIn("--require-all-translations", workflow)
-        self.assertIn("LI-NA/homebrew-zed-i18n", workflow)
-        self.assertIn("LI-NA/scoop-zed-i18n", workflow)
+        # このフォークの配布チャネルはマスター所有の tap/bucket を指す。
+        self.assertIn("NeoSloth/homebrew-zed-i18n", workflow)
+        self.assertIn("NeoSloth/scoop-zed-i18n", workflow)
         self.assertIn("diff --cached --quiet", workflow)
+
+    def test_packaging_urls_follow_manifest_repository(self) -> None:
+        # cask/scoop の URL は manifest の repository から導出されること。
+        # フォーク own releases への参照が上流既定に固定されないことを守る。
+        manifest = sample_universal_manifest()
+        manifest["repository"] = "example-owner/example-repo"
+
+        cask = generate_homebrew_cask(manifest)
+        self.assertIn('homepage "https://github.com/example-owner/example-repo"', cask)
+        self.assertIn("https://github.com/example-owner/example-repo/releases/download/", cask)
+        self.assertNotIn("LI-NA", cask)
+
+        scoop = generate_scoop_manifests(manifest)
+        app = json.loads(scoop["zed-i18n.json"])
+        self.assertEqual(app["homepage"], "https://github.com/example-owner/example-repo")
+        self.assertEqual(
+            app["checkver"]["url"],
+            "https://github.com/example-owner/example-repo/releases/latest",
+        )
 
     def test_homebrew_validates_generated_working_tree_before_publishing(self) -> None:
         workflow = (Path.cwd() / ".github" / "workflows" / "i18n-update-packaging.yml").read_text(
             encoding="utf-8"
         )
-        validation = workflow.index("brew readall --os=all --arch=all li-na/zed-i18n")
+        validation = workflow.index("brew readall --os=all --arch=all neosloth/zed-i18n")
         self.assertLess(workflow.index("uv run zed-i18n generate-packaging"), validation)
-        self.assertLess(workflow.index("brew trust li-na/zed-i18n"), validation)
+        self.assertLess(workflow.index("brew trust neosloth/zed-i18n"), validation)
         self.assertLess(validation, workflow.index("- name: Commit and push packaging repositories"))
         contract = workflow.index("brew ruby -- tests/check_homebrew_cask.rb")
         self.assertLess(validation, contract)
